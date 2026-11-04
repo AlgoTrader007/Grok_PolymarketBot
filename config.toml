@@ -1,0 +1,28 @@
+# polybtc — PAPER ONLY. There is no order-placing code in this project.
+[trader]
+edge_threshold   = 0.05   # flag when fair_prob - (ask + fee_per_share) >= this
+max_price        = 0.70   # never pay more than 70c per share
+size_usd         = 15.0   # notional per paper entry
+min_shares       = 5      # Polymarket min order size; partial fills below this are skipped
+min_secs_left    = 10     # no entries in the last N seconds (feed lag ~1.5-2.5s)
+min_secs_elapsed = 3      # wait until the price-to-beat is known
+max_feed_lag_s   = 6      # Chainlink data older than this => no signals
+max_book_age_s   = 30     # REST/ws book older than this => no signals
+entries_per_side = 1      # max paper entries per side per window
+fee_rate_default = 0.07   # crypto taker rate; overridden by each market's feeSchedule.rate
+
+[scout]
+poll_interval_s  = 1.0    # RTDS snapshot re-request cadence (snapshot-only feed; see README)
+nowcast          = true   # extrapolate Chainlink lag (1-4s) with live Coinbase ticks; settlement stays Chainlink
+vol_slow_window_s = 1800  # 30 min realized vol
+vol_fast_window_s = 300   # 5 min realized vol
+vol_return_step_s = 5     # returns sampled every 5s (reduces microstructure noise)
+vol_floor_ann    = 0.15   # annualized vol floor
+vol_cap_ann      = 3.00   # annualized vol cap
+vol_mult         = 1.0    # scale factor on sigma (model-risk knob)
+prob_clip        = 0.002  # clamp fair probs to [clip, 1-clip]
+
+[app]
+log_dir          = "logs"
+tick_log_every_s = 5      # model/market snapshot cadence for calibration
+timezone         = "America/Los_Angeles"

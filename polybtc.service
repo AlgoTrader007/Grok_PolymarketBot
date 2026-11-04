@@ -1,0 +1,17 @@
+# /etc/systemd/system/polybtc.service   (edit User/paths)
+[Unit]
+Description=polybtc paper trader (Polymarket BTC 5m, PAPER ONLY)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=polybtc
+WorkingDirectory=/opt/polybtc
+ExecStart=/opt/polybtc/.venv/bin/python /opt/polybtc/bot.py
+Restart=always
+RestartSec=3
+MemoryMax=200M
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
