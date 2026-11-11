@@ -107,7 +107,7 @@ cd D:\python\Grok_Polymarket
 .\.venv\Scripts\python.exe -c "print(open(r'logs\state.json', encoding='utf-8').read())"
 ```
 
-`view.py` reads `logs\state.json` beside `view.py`, not whatever directory the shell happens to be in. Ctrl+C stops only the viewer. `bot.py` keeps running. The clock is the `timezone` in `config.toml` (currently America/Los_Angeles) and is shown with that timestamp's numeric UTC offset. It is not relabeled PT or converted to the Windows time zone.
+`view.py` reads `logs\state.json` beside `view.py`, not whatever directory the shell happens to be in. Ctrl+C stops only the viewer. `bot.py` keeps running. The clock is the `timezone` in `config.toml` (currently America/Los_Angeles) and is shown with that timestamp's numeric UTC offset. It is not relabeled PT or converted to the Windows time zone. Windows does not ship that zone database; `tzdata` in `requirements.txt` supplies it.
 
 If the picture stops changing, check the file from a new terminal:
 
