@@ -57,48 +57,65 @@ On startup the bot reloads every unresolved position, including ones older than 
 
 The price-to-beat used for a new entry must have been received live from the RTDS TWAP at the start second. A late backfill does not make the window tradable. A hole in the Chainlink spot series longer than `max_feed_lag_s` (6 seconds) blocks that window for the rest of the window. A stale book blocks entry as well.
 
-## Windows install
+## Install and run with Python
 
-Use Python 3.12 from python.org (3.11 or newer is required by `polymarket-client`). These commands do not need a particular editor. VS Code is optional: File → Open Folder on `D:\python\Grok_Polymarket`, then Terminal → New Terminal, and run the same commands.
+Use Python 3.12 from python.org (3.11 or newer; `polymarket-client` requires it). Open `D:\python\Grok_Polymarket` in VS Code if you want that editor, then use Terminal → New Terminal. The commands call `python` directly. Do not activate the virtual environment and do not run a shell setup script.
 
-```powershell
-cd D:\
-mkdir python -Force
+Create the folder and clone once:
+
+```text
 cd D:\python
 git clone https://github.com/AlgoTrader007/Grok_PolymarketBot.git Grok_Polymarket
 cd D:\python\Grok_Polymarket
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-`install.ps1` creates `.venv`, installs `requirements.txt`, and copies `.env.example` to `.env` if `.env` is missing. Live trading is still off.
+Install:
 
-Paper run, in the foreground:
+```text
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -c "import shutil; shutil.copyfile('.env.example', '.env')"
+```
 
-```powershell
+Skip the copy command if `.env` already exists. Live trading is still off. On a machine where `py` is not the launcher, use `python -m venv .venv` and then `.venv\Scripts\python.exe` the same way. The Linux form of the same steps is `python3 -m venv .venv` and `.venv/bin/python`.
+
+Check the local configuration. This does not contact the exchange and does not send an order:
+
+```text
+cd D:\python\Grok_Polymarket
+.\.venv\Scripts\python.exe bot.py --check
+```
+
+A default checkout prints `mode: paper` and `orders: not sent`.
+
+Run in the foreground. This is the supported way to run it. Leave the terminal open.
+
+```text
 cd D:\python\Grok_Polymarket
 .\.venv\Scripts\python.exe -u bot.py
 ```
 
-Restart wrapper (the scheduled task uses this):
+Stop that process with Ctrl+C in the same terminal. The process saves `logs\execution_state.json`, and if a live client was connected it requests cancellation of resting orders, then exits. Ctrl+C does not turn live mode on and does not delete logs or `.env`. A hard close of the terminal can skip that cancel request; use Ctrl+C when you want the graceful stop. The process does not restart itself.
 
-```powershell
-.\run.ps1
+This repository does not register a Windows service, a Task Scheduler job, or a restart loop. Closing the terminal stops the bot until you start `bot.py` again yourself.
+
+Status and logs, from a second terminal while `bot.py` is running:
+
+```text
+cd D:\python\Grok_Polymarket
+.\.venv\Scripts\python.exe view.py
+.\.venv\Scripts\python.exe -c "print(open(r'logs\state.json', encoding='utf-8').read())"
 ```
 
-`start.bat` calls `run.ps1`. Another terminal:
+`view.py` reads `logs\state.json` and keeps refreshing until you press Ctrl+C. That stops only the viewer. `bot.py` keeps running.
 
-```powershell
-.\.venv\Scripts\python.exe view.py
+Report, using a calendar day in America/Los_Angeles:
+
+```text
 .\.venv\Scripts\python.exe risk_report.py --day 2026-11-10
 ```
 
-Register the logon task:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\register-task.ps1
-```
-
-Remove it with `.\unregister-task.ps1`.
+The report is also written to `reports\2026-11-10.md`. It does not place orders and does not enable live mode.
 
 ## Environment names
 
@@ -127,7 +144,7 @@ Both of these are required. Either one alone does nothing.
 1. In `config.toml`, set `enabled = true` under `[live]`.
 2. In the local `.env`, set `POLYBTC_LIVE_CONFIRM=YES` and the key and wallet variables.
 
-Then start `bot.py` or `run.ps1`. Before any order the bot also requires:
+Then start `bot.py` in the foreground, as above. Before any order the bot also requires:
 
 * no `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or SOCKS proxy variables (a proxy is a failed closed check, not something the bot routes around)
 * `GET https://polymarket.com/api/geoblock` returns `blocked: false` and a country other than `US` or `UM`
@@ -140,26 +157,26 @@ There is no paper fill while live mode was requested but blocked. That avoids a 
 
 ## Stop, cancel, and limits
 
-```powershell
+Ctrl+C in the `bot.py` terminal is the stop command. To refuse new entries even after the next start, latch the kill file from any terminal. This does not start the bot and does not send an order:
+
+```text
 cd D:\python\Grok_Polymarket
-.\stop.ps1
+.\.venv\Scripts\python.exe bot.py --kill
 ```
 
-`stop.ps1` and `stop.bat` write `logs\KILL` and stop the wrapper. The scheduled task can start the process again; the kill file still blocks new entries. Cancel resting orders, which also latches the kill file:
+A running `bot.py` sees `logs\KILL` and stops new entries. It still exits only when that terminal gets Ctrl+C. Ctrl+C then saves state and, when a live client is connected, requests cancellation of resting orders.
 
-```powershell
-.\cancel.ps1
+Cancel resting orders without starting a trading loop. This needs the local key and wallet, places nothing, and also writes `logs\KILL`. If those variables are missing it exits without sending a cancel:
+
+```text
+.\.venv\Scripts\python.exe bot.py --cancel-all
 ```
 
-That runs `python bot.py --cancel-all`. It does not place an order. It needs the local key and wallet. If those are missing it exits without sending a cancel.
+Allow entries on a later start only when you mean to. This does not start the bot and does not set `POLYBTC_LIVE_CONFIRM`:
 
-Allow entries again only when you mean to:
-
-```powershell
-.\clear-kill.ps1
+```text
+.\.venv\Scripts\python.exe bot.py --clear-kill
 ```
-
-That deletes `logs\KILL` and does not start the bot and does not set `POLYBTC_LIVE_CONFIRM`. Closing the console, Ctrl+C, or a process stop also asks the client to `cancel_all` when the SDK session exists.
 
 Risk limits in `config.toml`: price 0.70, edge 0.05 after fees, $15 stake, one side per window, at most two attempts and only after a confirmed zero fill, and $75 of open cost. The probability model is not a risk limit and was not refit.
 
@@ -167,19 +184,22 @@ Risk limits in `config.toml`: price 0.70, edge 0.05 after fees, $15 stake, one s
 
 `logs\`, `reports\`, `.env`, and `.venv\` are gitignored.
 
-```powershell
+```text
 cd D:\python\Grok_Polymarket
-.\stop.ps1
+.\.venv\Scripts\python.exe bot.py --kill
+```
+
+Press Ctrl+C in the terminal that is running `bot.py`. Then:
+
+```text
 git status
 git pull
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\clear-kill.ps1
-.\run.ps1
+.\.venv\Scripts\python.exe bot.py --check
+.\.venv\Scripts\python.exe -u bot.py
 ```
 
-Skip `clear-kill.ps1` if you want the bot to stay unable to enter. `git pull` does not delete ignored logs or `.env`. If `git status` shows local edits to tracked files, resolve those before pulling. Do not copy `.env` into a commit. After a pull, check `config.toml`: a pulled file can set `enabled` back to `false`, which is the safe default.
-
-Linux `./run.sh`, `./stop.sh`, and `polybtc.service` are unchanged in role. `./stop.sh` stops the process and does not write `logs/KILL`; create that file yourself if a restart must not enter.
+Leave the kill file in place if the next start must not enter. Remove it first with `python bot.py --clear-kill` only when you want entries again. `git pull` does not delete ignored logs or `.env`. If `git status` shows local edits to tracked files, resolve those before pulling. Do not copy `.env` into a commit. After a pull, `--check` should still show `mode: paper` unless you set live mode yourself. A pulled `config.toml` keeps `enabled = false`.
 
 ## Layout
 
@@ -197,6 +217,6 @@ Logs in `logs/`: `signals.jsonl`, `trades.jsonl`, `trades.csv`, `ticks.jsonl`, `
 
 ## Tests
 
-`python -m pytest -q` covers config and geoblock refusal, edge and price and stake, stale data, both-side blocking, partial and rejected and ambiguous submits, duplicate prevention across a restart, official settlement retry, and the Windows script and workflow files. The order API is mocked. GitHub Actions runs that suite on `windows-latest` and `ubuntu-latest` with Python 3.12.
+`python -m pytest -q` covers config and geoblock refusal, edge and price and stake, stale data, both-side blocking, partial and rejected and ambiguous submits, duplicate prevention across a restart, official settlement retry, and the Python-only command docs. The order API is mocked. GitHub Actions runs that suite on `windows-latest` and `ubuntu-latest` with Python 3.12.
 
 Not tested, on purpose: no funded account, no real order, no cancel against the production CLOB, no live geoblock pass from an allowed country, and no claim that the model would have made money. A FAK partial caused by the book moving is implemented and mocked; the production matching engine was not exercised.
