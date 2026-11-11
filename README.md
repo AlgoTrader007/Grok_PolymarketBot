@@ -107,7 +107,17 @@ cd D:\python\Grok_Polymarket
 .\.venv\Scripts\python.exe -c "print(open(r'logs\state.json', encoding='utf-8').read())"
 ```
 
-`view.py` reads `logs\state.json` and keeps refreshing until you press Ctrl+C. That stops only the viewer. `bot.py` keeps running.
+`view.py` reads `logs\state.json` beside `view.py`, not whatever directory the shell happens to be in. Ctrl+C stops only the viewer. `bot.py` keeps running. The clock is the `timezone` in `config.toml` (currently America/Los_Angeles) and is shown with that timestamp's numeric UTC offset. It is not relabeled PT or converted to the Windows time zone.
+
+If the picture stops changing, check the file from a new terminal:
+
+```text
+py view.py --diag
+```
+
+`writer: advancing` means `bot.py` is still updating the file, so a frozen window is the viewer or a paused console. `writer: mtime did not change` together with `pid_alive: True` means that process is up but its state writer is not updating the file. `pid_alive: False` means that process is gone. The command prints the absolute path, the pid inside the file, and the file's age. It does not read environment variables and does not send an order.
+
+Selecting text in a Windows console can pause the program that owns that window until you press Esc or Enter. `--diag` is a separate process, so it can still see the file while the viewer window is paused. A screenshot of a still frame does not by itself show which of these happened.
 
 Report, using a calendar day in America/Los_Angeles:
 
