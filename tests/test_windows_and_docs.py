@@ -19,27 +19,29 @@ def test_model_snapshot_is_unchanged():
     assert abs(anchored - 0.922185168422864) < 1e-12
 
 
-def test_windows_scripts_and_workflow_are_editor_independent():
-    required = [
-        "install.ps1", "run.ps1", "stop.ps1", "clear-kill.ps1", "cancel.ps1",
-        "register-task.ps1", "unregister-task.ps1", "start.bat", "stop.bat", ".env.example",
-    ]
-    for name in required:
-        text = (ROOT / name).read_text(encoding="utf-8")
-        assert "cursor" not in text.lower()
-        assert "0x" + "ab" * 8 not in text
-    install = (ROOT / "install.ps1").read_text(encoding="utf-8")
-    assert r"D:\python\Grok_Polymarket" in install
-    task = (ROOT / "register-task.ps1").read_text(encoding="utf-8")
-    assert "Register-ScheduledTask" in task
-    assert "GrokPolymarket" in task
-    stop = (ROOT / "stop.ps1").read_text(encoding="utf-8")
-    assert "KILL" in stop
+def test_python_commands_replace_shell_scripts():
+    assert list(ROOT.rglob("*.ps1")) == []
+    assert list(ROOT.rglob("*.bat")) == []
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
     workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+    for banned in (".ps1", ".bat", "Activate.ps1", "powershell"):
+        assert banned.lower() not in readme.lower()
+        assert banned.lower() not in workflow.lower()
+    assert r"D:\python\Grok_Polymarket" in readme
+    assert r".\.venv\Scripts\python.exe -m pip install -r requirements.txt" in readme
+    assert "bot.py --check" in readme
+    assert "bot.py --kill" in readme
+    assert "bot.py --clear-kill" in readme
+    assert "bot.py --cancel-all" in readme
+    assert "Ctrl+C" in readme
+    assert "Task Scheduler" in readme
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "cursor" not in example.lower()
     assert "windows-latest" in workflow
     assert "ubuntu-latest" in workflow
     assert "actions/setup-python" in workflow
     assert "cursor" not in workflow.lower()
+    assert "python -m pytest -q" in workflow
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
     assert ".env" in ignore and "logs/" in ignore
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
@@ -52,3 +54,35 @@ def test_windows_scripts_and_workflow_are_editor_independent():
     assert r"D:\python\Grok_Polymarket" in readme
     assert "POLYBTC_LIVE_CONFIRM" in readme
     assert "unreliable" in readme.lower()
+
+
+def test_check_and_kill_commands_do_not_trade(tmp_path):
+    import bot
+    secret = "super-secret-private-key-value"
+    proxy = "http://user:password@127.0.0.1:9"
+    code, text = bot.format_check(
+        bot.CFG,
+        {"POLYMARKET_PRIVATE_KEY": secret, "HTTPS_PROXY": proxy},
+        kill_exists=False,
+        env_file_exists=False,
+    )
+    assert code == 0
+    assert "mode: paper" in text
+    assert "orders: not sent" in text
+    assert secret not in text
+    assert proxy not in text
+    blocked, blocked_text = bot.format_check(
+        {"live": {"enabled": True}},
+        {"POLYBTC_LIVE_CONFIRM": "YES", "POLYMARKET_PRIVATE_KEY": secret},
+        kill_exists=False,
+        env_file_exists=True,
+    )
+    assert blocked == 1
+    assert "mode: live_blocked" in blocked_text
+    assert "wallet_missing" in blocked_text
+    assert secret not in blocked_text
+    kill = tmp_path / "logs" / "KILL"
+    bot.write_kill_file(kill)
+    assert kill.read_text(encoding="utf-8") == "kill\n"
+    assert bot.clear_kill_file(kill) is True
+    assert bot.clear_kill_file(kill) is False

@@ -780,6 +780,52 @@ async def main():
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await _shutdown(broker)
+            print("stopped; execution state saved", flush=True)
+            if broker is not None:
+                print("resting-order cancel was requested", flush=True)
+
+
+def format_check(cfg, environ, kill_exists: bool, env_file_exists: bool) -> tuple[int, str]:
+    """Read local config only. No network, no orders, and no secret values."""
+    limits = live_exec.live_config(cfg, environ)
+    if not limits["requested"]:
+        mode = "paper"
+    elif limits["ready"] and not kill_exists:
+        mode = "live_config_ready"
+    else:
+        mode = "live_blocked"
+    lines = [
+        f"mode: {mode}",
+        f"live.enabled: {str(bool((cfg.get('live') or {}).get('enabled', False))).lower()}",
+        f"live.requested: {str(bool(limits['requested'])).lower()}",
+        f"local_ready: {str(bool(limits['ready'])).lower()}",
+        "reasons: " + (",".join(limits["reasons"]) if limits["reasons"] else "none"),
+        "POLYBTC_LIVE_CONFIRM: " + ("YES" if str(environ.get("POLYBTC_LIVE_CONFIRM") or "") == live_exec.CONFIRM_VALUE else "not YES"),
+        "POLYMARKET_PRIVATE_KEY: " + ("set" if environ.get("POLYMARKET_PRIVATE_KEY") else "missing"),
+        "POLYMARKET_WALLET_ADDRESS: " + ("set" if environ.get("POLYMARKET_WALLET_ADDRESS") else "missing"),
+        "proxy_env: " + ("set" if gates.proxy_env_set(environ) else "unset"),
+        "kill_file: " + ("present" if kill_exists else "absent"),
+        "env_file: " + ("present" if env_file_exists else "absent"),
+        "orders: not sent",
+    ]
+    if mode == "live_config_ready":
+        lines.append("note: geoblock and closed-only are checked only while bot.py is running; this check did not contact the exchange")
+    code = 1 if limits["requested"] and not limits["ready"] else 0
+    return code, "\n".join(lines)
+
+
+def write_kill_file(path) -> None:
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("kill\n")
+
+
+def clear_kill_file(path) -> bool:
+    if os.path.exists(path):
+        os.remove(path)
+        return True
+    return False
 
 
 async def cancel_all():
@@ -797,7 +843,7 @@ async def cancel_all():
     result = await S.engine.cancel_resting()
     await S.engine.reconcile_open()
     await broker.close()
-    print("Cancel requested. New entries stay off until logs/KILL is removed.")
+    print("Cancel requested. New entries stay off until you run: python bot.py --clear-kill")
     print("canceled" if result.get("ok") else "cancel_failed")
     return 0 if result.get("ok") else 1
 
@@ -817,8 +863,30 @@ def _install_signals():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="polybtc BTC 5-minute watcher. Paper unless live mode is enabled locally.")
+    parser.add_argument("--check", action="store_true", help="Validate local config. No network and no orders.")
+    parser.add_argument("--kill", action="store_true", help="Latch logs/KILL so new entries stay off. Does not start the bot.")
+    parser.add_argument("--clear-kill", action="store_true", help="Remove logs/KILL. Does not start the bot or enable live mode.")
     parser.add_argument("--cancel-all", action="store_true", help="Cancel resting account orders and latch the kill switch. Places nothing.")
     args = parser.parse_args()
+    chosen = [args.check, args.kill, args.clear_kill, args.cancel_all]
+    if sum(bool(item) for item in chosen) > 1:
+        parser.error("use only one of --check, --kill, --clear-kill, or --cancel-all")
+    kill_path = os.path.join(LOG, "KILL")
+    if args.check:
+        persist.load_env_file(os.path.join(HERE, ".env"))
+        code, text = format_check(CFG, os.environ, os.path.exists(kill_path), os.path.exists(os.path.join(HERE, ".env")))
+        print(text)
+        sys.exit(code)
+    if args.kill:
+        write_kill_file(kill_path)
+        print("kill file written; new entries stay off. The bot was not started and no order was sent.")
+        print("Stop a foreground bot with Ctrl+C in its terminal. Remove the latch with: python bot.py --clear-kill")
+        sys.exit(0)
+    if args.clear_kill:
+        removed = clear_kill_file(kill_path)
+        print("kill file removed." if removed else "kill file was not present.")
+        print("The bot was not started. Live mode stays off unless config.toml and POLYBTC_LIVE_CONFIRM=YES are both set.")
+        sys.exit(0)
     _install_signals()
     if args.cancel_all:
         sys.exit(asyncio.run(cancel_all()))
