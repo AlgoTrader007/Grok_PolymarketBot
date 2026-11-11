@@ -21,16 +21,29 @@ def day_of(ts_la):
     return ts_la[:10] if ts_la else None
 
 
+OFFICIAL = {"gamma_official", "gamma_outcome_prices", "gamma_final_price"}
+
+
 def load_trades():
+    """Official settlements only. UNKNOWN and feed-only rows are not results."""
     p = os.path.join(LOG, "trades.csv")
-    if not os.path.exists(p): return []
-    out = []
+    if not os.path.exists(p): return [], 0
+    by_key = {}
+    unresolved = 0
     for r in csv.DictReader(open(p)):
         for k in ("ask_vwap", "fee_usd", "fee_per_share", "fair_prob", "edge", "shares", "cost_usd", "pnl_usd"):
             try: r[k] = float(r[k])
             except Exception: r[k] = None
-        out.append(r)
-    return out
+        key = (r.get("slug"), r.get("side"), r.get("entry_time_la"))
+        official = r.get("result") in ("WIN", "LOSS") and r.get("settle_source") in OFFICIAL
+        if not official:
+            unresolved += 1
+            by_key.setdefault(key, None)
+            continue
+        by_key[key] = r
+    rows = [row for row in by_key.values() if row]
+    rows.sort(key=lambda row: row.get("entry_time_la") or "")
+    return rows, unresolved
 
 
 def jsonl(name):
@@ -55,12 +68,17 @@ def main():
     D = a.day
     L = []
     pr = lambda s="": L.append(s)
-    trades = load_trades()
+    trades, unresolved = load_trades()
     by_day = defaultdict(float)
     for t in trades:
         if t["pnl_usd"] is not None: by_day[day_of(t["entry_time_la"])] += t["pnl_usd"]
     td = sorted([t for t in trades if day_of(t["entry_time_la"]) == D], key=lambda t: t["entry_time_la"])
-    pr(f"# polybtc Risk report for {D} (America/Los_Angeles), PAPER ONLY")
+    pr(f"# polybtc risk report for {D} (America/Los_Angeles)")
+    pr()
+    pr("Historical paper rows are incomplete. Rows without an official Gamma settlement")
+    pr("(UNKNOWN, or a feed-only TWAP result) are excluded and are not losses.")
+    pr(f"Excluded unresolved rows in the whole file: {unresolved}.")
+    pr("A green week does not enable live trading and is not evidence of a profitable strategy.")
     pr()
     n = len(td); wins = sum(t["result"] == "WIN" for t in td)
     net = sum(t["pnl_usd"] or 0 for t in td); fees = sum(t["fee_usd"] or 0 for t in td)
@@ -125,7 +143,7 @@ def main():
         v = by_day.get(d); g = v is not None and v > 0; ok &= g
         pr(f"  {d}: {'no trades' if v is None else f'${v:.2f}'}  {'green' if g else 'NOT green'}")
     pr(f"GREEN WEEK: {'PASS' if ok else 'FAIL'}")
-    pr("(PASS only means the paper gate is met; this code cannot place real orders.)")
+    pr("PASS/FAIL is a log check only. It does not place orders or turn live mode on.")
     out = "\n".join(L)
     print(out)
     os.makedirs(os.path.join(HERE, "reports"), exist_ok=True)

@@ -1,15 +1,25 @@
-# polybtc — PAPER ONLY. There is no order-placing code in this project.
+# polybtc. Paper mode is the default. Live orders stay off until [live] enabled
+# is true AND the local environment sets POLYBTC_LIVE_CONFIRM=YES.
+# One direction per window is always enforced. entries_per_side cannot enable both sides.
 [trader]
-edge_threshold   = 0.05   # flag when fair_prob - (ask + fee_per_share) >= this
+edge_threshold   = 0.05   # fair_prob - (ask + fee_per_share) must reach this on every share bought
 max_price        = 0.70   # never pay more than 70c per share
-size_usd         = 15.0   # notional per paper entry
-min_shares       = 5      # Polymarket min order size; partial fills below this are skipped
-min_secs_left    = 10     # no entries in the last N seconds (feed lag ~1.5-2.5s)
-min_secs_elapsed = 3      # wait until the price-to-beat is known
-max_feed_lag_s   = 6      # Chainlink data older than this => no signals
-max_book_age_s   = 30     # REST/ws book older than this => no signals
-entries_per_side = 1      # max paper entries per side per window
-fee_rate_default = 0.07   # crypto taker rate; overridden by each market's feeSchedule.rate
+size_usd         = 15.0   # full stake required on the displayed book; thin books are skipped
+min_shares       = 5      # floor; the live book minimum is also required and can be higher
+min_secs_left    = 10     # no entries in the last N seconds
+min_secs_elapsed = 3      # wait until the window has opened
+max_feed_lag_s   = 6      # Chainlink data older than this, or a longer hole in the window, blocks entry
+max_book_age_s   = 30     # book older than this blocks entry
+entries_per_side = 1      # retained for old configs; the bot still allows only one side per window
+fee_rate_default = 0.07   # crypto taker rate used only when Gamma omits feeSchedule.rate
+
+[live]
+enabled = false                 # must also set POLYBTC_LIVE_CONFIRM=YES in the local environment
+order_type = "FAK"              # market buy: fill what is still available at or below the price cap, cancel the rest
+max_open_cost_usd = 75.0        # unsettled fill cost plus reserved stake
+max_attempts_per_window = 2     # a retry is allowed only after a confirmed zero-fill, same side only
+submit_timeout_s = 20
+geoblock_max_age_s = 30
 
 [scout]
 poll_interval_s  = 1.0    # RTDS snapshot re-request cadence (snapshot-only feed; see README)

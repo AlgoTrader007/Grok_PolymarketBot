@@ -1,52 +1,202 @@
-# polybtc — Polymarket 5-minute "Bitcoin Up or Down", PAPER ONLY
+# polybtc — Polymarket BTC 5-minute Up/Down
 
-Four roles, one small asyncio process (+ a morning report script):
+Paper mode is the default. The bot watches public BTC 5-minute markets and can
+place real orders only after you turn that on yourself, on the machine that
+holds the keys. Nothing in this repository enables a funded account, and a
+green week in the log does not turn live mode on.
 
-| Role | Where | What it does |
-|---|---|---|
-| **Scout** | `bot.py` (rtds_loop, update_sigma) + `model.py` | Streams Chainlink BTC/USD **spot and 60s TWAP** (the settlement stream) from Polymarket's public RTDS socket, records each window's price-to-beat (TWAP60 at the start second), estimates vol, computes fair P(Up)/P(Down). |
-| **Trader** | `bot.py` (trader_eval) | Each side: `edge = fair − (best_ask + fee_per_share)`. Flags a **paper** entry when edge ≥ 0.05 and ask ≤ 0.70, $15 notional, walking real book depth (only levels that still meet both rules). Max 1 entry per side per window. |
-| **Settler** | `bot.py` (settle_loop) | Provisional result from TWAP60 at the end second, then final result from Polymarket's own Gamma record (`outcomePrices`/`eventMetadata.finalPrice`); logs any mismatch. PnL includes fees. |
-| **Risk** | `risk_report.py` | Daily review + green-week PASS/FAIL. |
-| **Builder** | this repo | `run.sh`, `polybtc.service`, `view.py`. |
+Historical paper results in `logs/` are unreliable and incomplete. The earlier
+paper run could buy both sides of one window, keep a partial size when the book
+was thinner than $15, trade after a price-feed gap, and book a missing close as
+`UNKNOWN` with a full loss. Those rows are not a track record. This change does
+not alter the probability model in `model.py` and does not claim that model is
+calibrated.
 
-**Real trading is impossible in this code:** there is no order-placing code, no signing, no wallet, no API keys. Only public GET/WebSocket reads. Switching to real bets would need new code, a Polymarket account in an eligible jurisdiction, and the user's explicit approval.
+## What it trades
 
-## Run
-```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-setsid nohup ./run.sh >/dev/null 2>&1 &     # restart-on-crash wrapper
-.venv/bin/python view.py                     # live terminal (Ctrl-C to quit; bot keeps running)
-.venv/bin/python risk_report.py --day 2026-11-03
-./stop.sh                                    # stop wrapper + bot
+BTC 5-minute Up/Down markets only (`btc-updown-5m-<unix start>`).
+
+| Rule | Value |
+|---|---|
+| Price cap | 0.70 per share |
+| Minimum net edge | 0.05 per share after the market's taker fee |
+| Stake | $15 of pUSD per entry, and only when the displayed book can fill all of it |
+| Direction | one side per window |
+| Default mode | paper |
+
+Checked against public data on 2026-11-10 (no order was sent):
+
+* Gamma `feeSchedule` was `rate 0.07`, `exponent 1`, taker only. That matches the published crypto fee `fee = shares × 0.07 × price × (1 − price)`, rounded to 5 decimal pUSD. At 100 shares the fee is $1.75 at 0.50 and $1.47 at 0.70. Makers pay zero. This bot takes liquidity, so the fee applies. `takerBaseFee: 1000` on that payload is not used as the rate.
+* The order book reported `tick_size` 0.01 and `min_order_size` 5. CLOB market info reported `mts` 0.001 and `mos` 5. Prices must fit the coarser 0.01 tick. If those tick sources disagree in a way that is not a multiple, the bot does not send an order.
+* The market version was `v1` (CTF token ids). A `v2` market is not traded.
+* Resolution source: Chainlink BTC/USD 60-second TWAP (`https://data.chain.link/streams/btc-usd-twap-60s-streams`). Up if the final TWAP is greater than or equal to the TWAP at the start. Down otherwise. Coinbase prices are only a lag nowcast for the unchanged model. They are not the settlement price.
+
+## What a live order actually does
+
+The displayed book must already show at least $15 of asks at prices that are on the tick, at or below 0.70, and still have at least 0.05 of edge after the fee. If it does not, the bot skips the window. It does not shrink the stake to whatever size is sitting there.
+
+When the book passes, live mode sends one Fill-And-Kill (FAK) buy through the official `polymarket-client` (`AsyncSecureClient.create_market_order` then `post_order`) for the $15 amount. `max_price` is the worst ask on that snapshot that still cleared the edge and the 0.70 cap, not a blank market buy.
+
+Unavoidable exchange behavior, from the current order docs:
+
+* The book can move after the check. FAK then buys only the shares still available at or below `max_price` and cancels the rest. A fill can be smaller than $15, or zero. The bot keeps the actual fill and does not send a second order to top the position up.
+* A zero fill that the API confirms (`fak_not_filled`, or a reconcile that proves the order never landed) may be retried once, on the same side only. The other side stays blocked for that window.
+* If the HTTP response is lost, the intent is already on disk as `submit_unknown`. The bot looks up the order and account trades before it will send anything else. If the lookup fails, or more than one trade could match, it stays unresolved and does not retry.
+* This market had taker delay enabled (`itode: true`). A `delayed` response is not a fill. The bot polls `get_order` and account trades. Amounts of zero on that response are not a position.
+* A FAK order is not supposed to rest. If one is still live, the bot calls `cancel_all` for this account. Use an account that this bot is the only trader on.
+* Until trade records arrive, a matched size can be valued at the limit price, which is the worst price the order was allowed to pay. Settlement PnL uses the trade cost once those records exist. `cost_basis` is `trades`, `human`/`e6`, or `limit_price_cap`.
+* Fees are charged by Polymarket at match time in pUSD. They are not a field inside the signed order. Winning shares redeem for $1. Losing shares redeem for $0. The bot does not redeem; it accounts the resolution.
+
+Open cost of unsettled fills, plus the stake reserved by an in-flight intent, cannot exceed `max_open_cost_usd` (75). One window still cannot exceed the $15 stake.
+
+## Settlement
+
+A position stays open until Gamma reports an official result: a closed market whose `outcomePrices` are 0 and 1, and/or `eventMetadata.finalPrice` compared with `priceToBeat`. If those two official signals disagree, the position stays open. A missing close is not a loss. The Chainlink print at the end of the window is logged as a provisional observation and is not the PnL.
+
+On startup the bot reloads every unresolved position, including ones older than 15 minutes, and keeps asking Gamma. Official results are retried every 15 seconds for the first 30 minutes after the window, then every 60 seconds, with no cutoff. `UNKNOWN` and feed-only rows already in `trades.csv` are not counted as realized PnL.
+
+The price-to-beat used for a new entry must have been received live from the RTDS TWAP at the start second. A late backfill does not make the window tradable. A hole in the Chainlink spot series longer than `max_feed_lag_s` (6 seconds) blocks that window for the rest of the window. A stale book blocks entry as well.
+
+## Windows install
+
+Use Python 3.12 from python.org (3.11 or newer is required by `polymarket-client`). These commands do not need a particular editor. VS Code is optional: File → Open Folder on `D:\python\Grok_Polymarket`, then Terminal → New Terminal, and run the same commands.
+
+```powershell
+cd D:\
+mkdir python -Force
+cd D:\python
+git clone https://github.com/AlgoTrader007/Grok_PolymarketBot.git Grok_Polymarket
+cd D:\python\Grok_Polymarket
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
-On a $5 VPS use systemd instead: copy to `/opt/polybtc`, edit `polybtc.service`, `systemctl enable --now polybtc`.
-Uses ~40 MB RAM, ~1 request/2 s to RTDS, a Gamma call per window, REST book resync every 15 s.
 
-## Config
-All knobs in `config.toml` (edge threshold, max price, size, vol window, staleness guards).
-The fee rate is read per market from Gamma `feeSchedule` (currently `rate 0.07, exponent 1`, taker-only):
-`fee_per_share = 0.07 × p × (1−p)` → 1.75¢/share at 50¢, 1.47¢ at 70¢.
+`install.ps1` creates `.venv`, installs `requirements.txt`, and copies `.env.example` to `.env` if `.env` is missing. Live trading is still off.
 
-## Model (Scout)
-Settlement: Up iff TWAP60(T_end) ≥ TWAP60(T_start). Spot = driftless GBM, per-second vol σ.
-* ≥60 s left: `P(Up) = Φ( ln(S/K) / (σ·√(τ−40)) )` — the brief's `Φ(ln(S/S0)/(σ√t))` with effective time τ−40 because the final price is a 60-s average (variance of an average over 60 s = 60/3).
-* <60 s left: anchor on the live official TWAP: `E[TWAP_end] = TWAP(t) + (τ·S − Σ S_{u−60})/60`, `sd = S·σ·√(τ³/3)/60`.
-* σ: 5-second log returns of Chainlink spot, winsorized at 6×MAD, blend of 30-min and 5-min realized vol, seeded from Coinbase 1-min candles at startup until 30 min of history exists, floored 15%/capped 300% annualized.
-* Feed lag (~1.3–3 s) is handled by computing τ from the data timestamp, and no entries in the final 10 s.
+Paper run, in the foreground:
 
-## Logs (`logs/`, timestamps America/Los_Angeles)
-* `signals.jsonl` – every edge ≥ threshold (incl. blocked ones and why)
-* `trades.jsonl` – paper entries and settlements; `trades.csv` – one row per settled trade
-* `ticks.jsonl` – 5-s model/market snapshots (for calibration); `events.jsonl` – discovery, price-to-beat, settlements, anomalies, restarts
-* `state.json` – live state for `view.py`; `bot.out` – stderr
+```powershell
+cd D:\python\Grok_Polymarket
+.\.venv\Scripts\python.exe -u bot.py
+```
 
-## Data sources
-* Gamma: `https://gamma-api.polymarket.com/events?slug=btc-updown-5m-<unix start, multiple of 300>`
-* Books: `wss://ws-subscriptions-clob.polymarket.com/ws/market`, `https://clob.polymarket.com/book?token_id=`
-* Chainlink: legacy RTDS `wss://ws-live-data.polymarket.com`, topics `crypto_prices_chainlink` + `crypto_prices_twap_sixty` (`btc/usd`). It now returns a 60-s snapshot per subscribe but no live push, so we re-subscribe every 2 s. Polymarket's replacement (PolyBolt `wss://ws-live-v2.polymarket.com/ws`, `price.crypto.twap`) needs CLOB API credentials. If the legacy socket is shut off, the bot stops signalling (feed_stale) and logs `feed_gap`.
+Restart wrapper (the scheduled task uses this):
 
-## Notes from the first live run (2026-11-03 PT)
-* Without the Coinbase lag nowcast, the order book ran 3–5 s ahead of the Chainlink snapshot, and the first "edges" were just stale data (e.g. a 20-point "edge" on Down at 21:40:11 that lost). With the nowcast, Scout's P(Up) tracks the market within ~1–3 points. Expect most 5-point edges to be adverse selection until a week of paper results says otherwise.
-* Our price-to-beat (TWAP60 at the start second) matched Polymarket's official `priceToBeat` exactly. Gamma publishes `priceToBeat` only after the window ends, and the official result 3–10 minutes later.
-* The two trades on 1793770800 (21:40 PT) came from v1, before the nowcast was added.
+```powershell
+.\run.ps1
+```
+
+`start.bat` calls `run.ps1`. Another terminal:
+
+```powershell
+.\.venv\Scripts\python.exe view.py
+.\.venv\Scripts\python.exe risk_report.py --day 2026-11-10
+```
+
+Register the logon task:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\register-task.ps1
+```
+
+Remove it with `.\unregister-task.ps1`.
+
+## Environment names
+
+Secrets are read from the process environment and, if present, from a local `.env` file. Existing process variables win over `.env`. The file is gitignored. Do not commit it, and do not paste key values into the repository, a pull request, or a chat.
+
+| Name | Purpose |
+|---|---|
+| `POLYBTC_LIVE_CONFIRM` | Must be exactly `YES` or live mode stays off |
+| `POLYMARKET_PRIVATE_KEY` | Signer private key for the official SDK |
+| `POLYMARKET_WALLET_ADDRESS` | Polymarket account wallet that holds pUSD |
+| `POLYMARKET_RELAYER_API_KEY` | Optional. Gasless relayer only |
+| `POLYMARKET_RELAYER_API_KEY_ADDRESS` | Optional. Relayer key address |
+| `POLYMARKET_BUILDER_API_KEY` | Optional. Builder wallet deployment only |
+| `POLYMARKET_BUILDER_SECRET` | Optional. Builder secret |
+| `POLYMARKET_BUILDER_PASSPHRASE` | Optional. Builder passphrase |
+| `POLYBTC_KILL` | Set to `1` to latch the kill switch |
+
+Wallet types are chosen by the SDK, not by a hard-coded signature number. Accounts created on polymarket.com on or after 2026-05-04 use a deposit wallet (signature type 3, POLY_1271). Older email or Google accounts use a proxy wallet (type 1). MetaMask or Rabby accounts use a Safe (type 2). `POLYMARKET_WALLET_ADDRESS` is that account wallet, copied from the Polymarket profile, not a newly guessed address. The private key is the signer for that wallet. Relayer and builder keys are not required to place CLOB orders for an existing wallet. This bot will not deploy a wallet for you.
+
+Logs pass through redaction for those secret values. Do not point the SDK at a custom host. The geoblock URL is fixed at `https://polymarket.com/api/geoblock`.
+
+## Turn live mode on
+
+Both of these are required. Either one alone does nothing.
+
+1. In `config.toml`, set `enabled = true` under `[live]`.
+2. In the local `.env`, set `POLYBTC_LIVE_CONFIRM=YES` and the key and wallet variables.
+
+Then start `bot.py` or `run.ps1`. Before any order the bot also requires:
+
+* no `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or SOCKS proxy variables (a proxy is a failed closed check, not something the bot routes around)
+* `GET https://polymarket.com/api/geoblock` returns `blocked: false` and a country other than `US` or `UM`
+* `get_closed_only_mode()` is false
+* the kill file `logs\KILL` is absent and `POLYBTC_KILL` is unset
+
+If any check fails, no new order is sent. The process can still settle positions and cancel. A refused geoblock check is final for new entries until a later check passes. This host used while writing the code was geoblocked (`blocked: true`, country `US`); that is expected and is not bypassed.
+
+There is no paper fill while live mode was requested but blocked. That avoids a paper position that looks like an order.
+
+## Stop, cancel, and limits
+
+```powershell
+cd D:\python\Grok_Polymarket
+.\stop.ps1
+```
+
+`stop.ps1` and `stop.bat` write `logs\KILL` and stop the wrapper. The scheduled task can start the process again; the kill file still blocks new entries. Cancel resting orders, which also latches the kill file:
+
+```powershell
+.\cancel.ps1
+```
+
+That runs `python bot.py --cancel-all`. It does not place an order. It needs the local key and wallet. If those are missing it exits without sending a cancel.
+
+Allow entries again only when you mean to:
+
+```powershell
+.\clear-kill.ps1
+```
+
+That deletes `logs\KILL` and does not start the bot and does not set `POLYBTC_LIVE_CONFIRM`. Closing the console, Ctrl+C, or a process stop also asks the client to `cancel_all` when the SDK session exists.
+
+Risk limits in `config.toml`: price 0.70, edge 0.05 after fees, $15 stake, one side per window, at most two attempts and only after a confirmed zero fill, and $75 of open cost. The probability model is not a risk limit and was not refit.
+
+## Update from GitHub without losing logs or secrets
+
+`logs\`, `reports\`, `.env`, and `.venv\` are gitignored.
+
+```powershell
+cd D:\python\Grok_Polymarket
+.\stop.ps1
+git status
+git pull
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\clear-kill.ps1
+.\run.ps1
+```
+
+Skip `clear-kill.ps1` if you want the bot to stay unable to enter. `git pull` does not delete ignored logs or `.env`. If `git status` shows local edits to tracked files, resolve those before pulling. Do not copy `.env` into a commit. After a pull, check `config.toml`: a pulled file can set `enabled` back to `false`, which is the safe default.
+
+Linux `./run.sh`, `./stop.sh`, and `polybtc.service` are unchanged in role. `./stop.sh` stops the process and does not write `logs/KILL`; create that file yourself if a restart must not enter.
+
+## Layout
+
+| Piece | Role |
+|---|---|
+| `model.py` | Unchanged fair P(Up). Driftless GBM with a 60-second TWAP. |
+| `bot.py` | Public feeds, gates, paper entries, official settlement, live submit loop |
+| `gates.py` | Edge, tick, depth, staleness, one-side, and geoblock decisions |
+| `live_exec.py` | Official SDK adapter, durable intents, reconcile, cancel |
+| `settlement.py` | Official outcome and restart restore |
+| `view.py` | Reads `logs/state.json` |
+| `risk_report.py` | Official rows only. Green week does not enable live mode |
+
+Logs in `logs/`: `signals.jsonl`, `trades.jsonl`, `trades.csv`, `ticks.jsonl`, `events.jsonl`, `state.json`, and `execution_state.json` (intents and open positions). Timestamps are America/Los_Angeles.
+
+## Tests
+
+`python -m pytest -q` covers config and geoblock refusal, edge and price and stake, stale data, both-side blocking, partial and rejected and ambiguous submits, duplicate prevention across a restart, official settlement retry, and the Windows script and workflow files. The order API is mocked. GitHub Actions runs that suite on `windows-latest` and `ubuntu-latest` with Python 3.12.
+
+Not tested, on purpose: no funded account, no real order, no cancel against the production CLOB, no live geoblock pass from an allowed country, and no claim that the model would have made money. A FAK partial caused by the book moving is implemented and mocked; the production matching engine was not exercised.

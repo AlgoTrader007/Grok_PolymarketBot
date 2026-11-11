@@ -1,6 +1,6 @@
 # /etc/systemd/system/polybtc.service   (edit User/paths)
 [Unit]
-Description=polybtc paper trader (Polymarket BTC 5m, PAPER ONLY)
+Description=polybtc Polymarket BTC 5m (paper unless live is enabled in config)
 After=network-online.target
 Wants=network-online.target
 
