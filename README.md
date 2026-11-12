@@ -127,6 +127,20 @@ Report, using a calendar day in America/Los_Angeles:
 
 The report is also written to `reports\2026-11-10.md`. It does not place orders and does not enable live mode.
 
+## Live PnL chart
+
+Run this in a third terminal while `bot.py` is running. It only reads `logs\trades.csv` and `logs\state.json` next to the script. It does not read `.env` and it does not send orders. Ctrl+C closes the chart and leaves the bot running. Times follow `timezone` in `config.toml` (currently America/Los_Angeles), not the Windows clock.
+
+```text
+.\.venv\Scripts\python.exe pnl_chart.py
+.\.venv\Scripts\python.exe pnl_chart.py --day
+.\.venv\Scripts\python.exe pnl_chart.py --since 2026-11-01 --interval 5
+.\.venv\Scripts\python.exe pnl_chart.py --png pnl.png
+.\.venv\Scripts\python.exe pnl_chart.py --web
+```
+
+`--day` with no date is today in the config timezone. `--png` writes one image and exits. `--web` serves the same image at `http://127.0.0.1:8765/` on that machine only; open it in a browser on the Remote Desktop session. If the desktop window cannot open, use `--web`. A state file older than 5 seconds is marked STALE. A locked or half-written file is retried, and the chart keeps the last read that succeeded. Official settlements are the only rows on the realized line. Open positions are marked only when the state file has a bid or an explicit mark for them.
+
 ## Environment names
 
 Secrets are read from the process environment and, if present, from a local `.env` file. Existing process variables win over `.env`. The file is gitignored. Do not commit it, and do not paste key values into the repository, a pull request, or a chat.

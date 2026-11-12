@@ -3,3 +3,4 @@ aiohttp>=3.9
 rich>=13
 polymarket-client>=0.16,<1
 tzdata>=2024.1
+matplotlib>=3.8
