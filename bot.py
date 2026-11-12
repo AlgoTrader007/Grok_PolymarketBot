@@ -640,30 +640,37 @@ async def settle_loop(session):
 async def housekeeping():
     last_tick = 0
     while not S.shutdown:
-        now = time.time()
-        update_sigma(); prune(); trader_eval(force=True)
-        if S.last_feed_wall and now - S.last_feed_wall > TC["max_feed_lag_s"]:
-            _taint_gap(S.last_feed_wall, now)
-        if S.last_feed_wall and now - S.last_feed_wall > 10 and now - S.last_gap_logged > 60:
-            S.last_gap_logged = now
-            jlog("events.jsonl", {"type": "anomaly", "kind": "feed_gap", "secs": round(now - S.last_feed_wall, 1)})
-        snapshot = S.last_eval
-        if now - last_tick >= AC["tick_log_every_s"] and snapshot.get("sides"):
-            last_tick = now
-            jlog("ticks.jsonl", {k: snapshot.get(k) for k in ("slug", "secs_left", "K", "spot", "spot_now", "cb", "twap", "tau", "p_up",
-                                                              "method", "feed_lag", "sigma_ann", "sides", "blocked", "mode")})
-        _sync()
-        intents = []
-        if S.book is not None:
-            intents = [{"id": item.get("id"), "slug": item.get("slug"), "side": item.get("side"), "status": item.get("status"),
-                        "shares": item.get("shares"), "cost_usd": item.get("cost_usd"), "order_id": item.get("order_id")}
-                       for item in S.book.intents if item.get("status") not in {"rejected", "absent", "unmatched", "not_sent"}]
-        status = {"updated_la": la(), "uptime_s": int(now - S.started), "eval": {k: v for k, v in snapshot.items() if k != "_sigkey"},
-                  "sigma_src": S.sigma_src, "open_positions": S.positions, "realized_pnl": round(S.realized, 4),
-                  "n_trades": S.n_trades, "n_wins": S.n_wins, "feed_age_s": round(now - S.last_feed_wall, 1) if S.last_feed_wall else None,
-                  "markets": sorted(m["slug"] for m in S.markets.values()), "pid": os.getpid(), "mode": S.mode,
-                  "live_reason": S.live_reason, "kill": bool(S.book and S.book.kill), "open_intents": intents}
-        persist.atomic_write(os.path.join(LOG, "state.json"), status)
+        try:
+            now = time.time()
+            update_sigma(); prune(); trader_eval(force=True)
+            if S.last_feed_wall and now - S.last_feed_wall > TC["max_feed_lag_s"]:
+                _taint_gap(S.last_feed_wall, now)
+            if S.last_feed_wall and now - S.last_feed_wall > 10 and now - S.last_gap_logged > 60:
+                S.last_gap_logged = now
+                jlog("events.jsonl", {"type": "anomaly", "kind": "feed_gap", "secs": round(now - S.last_feed_wall, 1)})
+            snapshot = S.last_eval
+            if now - last_tick >= AC["tick_log_every_s"] and snapshot.get("sides"):
+                last_tick = now
+                jlog("ticks.jsonl", {k: snapshot.get(k) for k in ("slug", "secs_left", "K", "spot", "spot_now", "cb", "twap", "tau", "p_up",
+                                                                  "method", "feed_lag", "sigma_ann", "sides", "blocked", "mode")})
+            _sync()
+            intents = []
+            if S.book is not None:
+                intents = [{"id": item.get("id"), "slug": item.get("slug"), "side": item.get("side"), "status": item.get("status"),
+                            "shares": item.get("shares"), "cost_usd": item.get("cost_usd"), "order_id": item.get("order_id")}
+                           for item in S.book.intents if item.get("status") not in {"rejected", "absent", "unmatched", "not_sent"}]
+            status = {"updated_la": la(), "updated_unix": round(now, 3), "uptime_s": int(now - S.started),
+                      "eval": {k: v for k, v in snapshot.items() if k != "_sigkey"},
+                      "sigma_src": S.sigma_src, "open_positions": S.positions, "realized_pnl": round(S.realized, 4),
+                      "n_trades": S.n_trades, "n_wins": S.n_wins, "feed_age_s": round(now - S.last_feed_wall, 1) if S.last_feed_wall else None,
+                      "markets": sorted(m["slug"] for m in S.markets.values()), "pid": os.getpid(), "mode": S.mode,
+                      "live_reason": S.live_reason, "kill": bool(S.book and S.book.kill), "open_intents": intents}
+            persist.atomic_write(os.path.join(LOG, "state.json"), status)
+        except Exception as exc:
+            try:
+                jlog("events.jsonl", {"type": "housekeeping_error", "err": type(exc).__name__})
+            except Exception:
+                pass
         await asyncio.sleep(1)
 
 

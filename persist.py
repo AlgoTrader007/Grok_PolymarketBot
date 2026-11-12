@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 
@@ -42,7 +43,18 @@ _SECRET_KEYS = {
 }
 
 
-def atomic_write(path: str | os.PathLike, obj) -> None:
+def replace_is_locked(exc: BaseException) -> bool:
+    """True when a replace failed because another process still has the destination open.
+
+    Windows denies os.replace in that case. Other errors, such as a full disk, are not locks.
+    """
+    if isinstance(exc, PermissionError):
+        return True
+    winerror = getattr(exc, "winerror", None)
+    return winerror in {5, 32}
+
+
+def atomic_write(path: str | os.PathLike, obj, retries: int = 8) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -51,7 +63,20 @@ def atomic_write(path: str | os.PathLike, obj) -> None:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    delay = 0.02
+    last = None
+    for attempt in range(max(1, retries)):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError as exc:
+            last = exc
+            if not replace_is_locked(exc) or attempt + 1 == max(1, retries):
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.25)
+    if last is not None:
+        raise last
 
 
 def read_json(path: str | os.PathLike, default=None):
