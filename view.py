@@ -144,6 +144,19 @@ def f(value, digits=4):
     return "-" if value is None else (f"{value:.{digits}f}" if isinstance(value, float) else str(value))
 
 
+def exposure_text(state: dict) -> str:
+    """Open fill cost, reserved stake, and the configured cap from state.json."""
+    def money(key):
+        value = state.get(key)
+        if value is None or value == "":
+            return "-"
+        try:
+            return f"${float(value):.2f}"
+        except (TypeError, ValueError):
+            return "-"
+    return f"open {money('open_cost')}  reserved {money('reserved_cost')}  cap {money('max_open_cost_usd')}"
+
+
 def render(path: Path = STATE_PATH):
     from rich.console import Group
     from rich.panel import Panel
@@ -166,6 +179,7 @@ def render(path: Path = STATE_PATH):
         f"model {evaluation.get('method', '-')}  feed lag {f(evaluation.get('feed_lag'), 1)}s  "
         f"blocked {evaluation.get('blocked') or evaluation.get('status') or '-'}\n"
         f"mode {state.get('mode', 'paper')}  reason {state.get('live_reason', '')}  kill {state.get('kill')}  "
+        f"{exposure_text(state)}  "
         f"PnL ${state.get('realized_pnl', 0):.2f}  trades {state.get('n_trades')}  wins {state.get('n_wins')}  "
         f"updated {clock_text(str(state.get('updated_la') or ''))}  pid {state.get('pid')}\n"
         f"state file age {age_text} {fresh}  {path}"

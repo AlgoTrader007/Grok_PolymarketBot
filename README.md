@@ -33,21 +33,24 @@ Checked against public data on 2026-11-10 (no order was sent):
 
 ## What a live order actually does
 
-The displayed book must already show at least $15 of asks at prices that are on the tick, at or below 0.70, and still have at least 0.05 of edge after the fee. If it does not, the bot skips the window. It does not shrink the stake to whatever size is sitting there.
+The displayed book must already show at least $15 of asks at prices that are on the tick, at or below 0.70, and still have at least 0.05 of edge after the fee. If it does not, the bot skips the window. It does not shrink the stake to whatever size is sitting there. Paper mode records that full $15 or it records nothing.
 
 When the book passes, live mode sends one Fill-And-Kill (FAK) buy through the official `polymarket-client` (`AsyncSecureClient.create_market_order` then `post_order`) for the $15 amount. `max_price` is the worst ask on that snapshot that still cleared the edge and the 0.70 cap, not a blank market buy.
 
 Unavoidable exchange behavior, from the current order docs:
 
-* The book can move after the check. FAK then buys only the shares still available at or below `max_price` and cancels the rest. A fill can be smaller than $15, or zero. The bot keeps the actual fill and does not send a second order to top the position up.
-* A zero fill that the API confirms (`fak_not_filled`, or a reconcile that proves the order never landed) may be retried once, on the same side only. The other side stays blocked for that window.
-* If the HTTP response is lost, the intent is already on disk as `submit_unknown`. The bot looks up the order and account trades before it will send anything else. If the lookup fails, or more than one trade could match, it stays unresolved and does not retry.
+* The book can move after the check. FAK then buys only the shares still available at or below `max_price` and cancels the rest. A live fill can be smaller than $15, or zero. One observed live partial was $13.30 of a $15 Down buy. The position stores the actual shares and cost, `partial` is true, and the unfilled remainder is not kept as reserved stake. The bot does not send a second order to top the position up. Paper never takes that reduced size: a thin book is a skip, not a smaller paper trade.
+* A zero fill that the API confirms (`fak_not_filled`, a validation reject, or a reconcile that proves the order never landed) may be retried once, on the same side only, and only when the gates still pass on a fresh check. The other side stays blocked for that window. A window still cannot hold more than one filled position.
+* `live_submit` rows in `trades.jsonl` include `error_class` and `error_message` for a failed or ambiguous post. The message is truncated and stripped of known secrets. `reason` is `submit_timeout` only when `asyncio.wait_for` actually hits `submit_timeout_s`. An exception from `post_order` is `submit_error:<Class>` (that used to be mislabeled `submit_timeout` even when the call returned in about a second). A validation or user-input reject is `not_sent` with `validation:<Class>` and does not count as an ambiguous submit.
+* After `submit_unknown`, the bot waits `reconcile_delay_s` (3 seconds) and reads open orders and account trades for that token. It tries up to `reconcile_attempts` (3) times. It does not post again during that lookup. A confirmed miss (`absent` / `confirmed_not_placed`) drops the reserved $15 and the same side can be evaluated again, still under `max_attempts_per_window` and the time and edge gates. A fill or partial is locked and is not retried. If the lookup fails, or more than one trade could match, the intent stays `submit_unknown` and does not retry yet.
 * This market had taker delay enabled (`itode: true`). A `delayed` response is not a fill. The bot polls `get_order` and account trades. Amounts of zero on that response are not a position.
 * A FAK order is not supposed to rest. If one is still live, the bot calls `cancel_all` for this account. Use an account that this bot is the only trader on.
 * Until trade records arrive, a matched size can be valued at the limit price, which is the worst price the order was allowed to pay. Settlement PnL uses the trade cost once those records exist. `cost_basis` is `trades`, `human`/`e6`, or `limit_price_cap`.
 * Fees are charged by Polymarket at match time in pUSD. They are not a field inside the signed order. Winning shares redeem for $1. Losing shares redeem for $0. The bot does not redeem; it accounts the resolution.
 
-Open cost of unsettled fills, plus the stake reserved by an in-flight intent, cannot exceed `max_open_cost_usd` (75). One window still cannot exceed the $15 stake.
+Open cost of unsettled fills, plus the stake reserved by an in-flight intent, cannot exceed `max_open_cost_usd` (75). One window still cannot exceed the $15 stake. Before a live order the bot also reads pUSD balance and allowance (`get_balance_allowance` for collateral, cached for `balance_max_age_s`, 15 seconds). If the lower of those is below the stake plus the taker-fee estimate, the side is skipped with `insufficient_balance`. That read does not place an order and does not change approvals.
+
+A `submit_unknown` reserves its stake until a lookup says the order is absent, until a fill is booked at the actual cost, or until the reservation expires. On every startup, including a paper startup, those intents are cleaned before new entries. Paper mode still never posts. When a key and wallet are present and no proxy is set, startup does the same read-only order and trade lookup and then closes the client. When they are not present, an intent whose window ended more than `unknown_expire_s` (1 hour) ago is marked `expired` with reason `unresolved_after_window` and stops counting toward the cap. The event is `reservation_released` in `events.jsonl`. The same sweep runs while the process is up: once a window has ended, a lookup with no fill releases the stake immediately, and an unknown that is still unresolved an hour after the window drops off the cap. A restart in paper mode is enough to clear intents left behind by an older session, such as the `submit_unknown` rows that kept reserving $15 each in `logs/execution_state.json`.
 
 ## Settlement
 
@@ -107,7 +110,7 @@ cd D:\python\Grok_Polymarket
 .\.venv\Scripts\python.exe -c "print(open(r'logs\state.json', encoding='utf-8').read())"
 ```
 
-`view.py` reads `logs\state.json` beside `view.py`, not whatever directory the shell happens to be in. Ctrl+C stops only the viewer. `bot.py` keeps running. The clock is the `timezone` in `config.toml` (currently America/Los_Angeles) and is shown with that timestamp's numeric UTC offset. It is not relabeled PT or converted to the Windows time zone. Windows does not ship that zone database; `tzdata` in `requirements.txt` supplies it.
+`view.py` reads `logs\state.json` beside `view.py`, not whatever directory the shell happens to be in. Ctrl+C stops only the viewer. `bot.py` keeps running. The header includes open fill cost, reserved stake, and the cap. The clock is the `timezone` in `config.toml` (the repository default is America/Los_Angeles) and is shown with that timestamp's numeric UTC offset. It is not relabeled PT or ET and it is not converted to the Windows time zone. For this machine, set `timezone = "America/New_York"` so logs, the viewer, and `skip_report.py` use US Eastern. Windows does not ship that zone database; `tzdata` in `requirements.txt` supplies it.
 
 If the picture stops changing, check the file from a new terminal:
 
@@ -127,9 +130,19 @@ Report, using a calendar day in America/Los_Angeles:
 
 The report is also written to `reports\2026-11-10.md`. It does not place orders and does not enable live mode.
 
+Skip reasons, one row in `logs\skips.jsonl` each time the set of block reasons changes for a window and side. The row has the config-timezone timestamp, slug, side, mode, every reason code, fair, edge, ask, open cost, reserved cost, and the cap. This includes `exposure_cap`, `live_not_allowed`, `already_entered`, `constraints_unknown`, `too_early`, `too_late`, and `insufficient_balance`.
+
+```text
+.\.venv\Scripts\python.exe skip_report.py
+.\.venv\Scripts\python.exe skip_report.py --day 2026-11-13
+.\.venv\Scripts\python.exe skip_report.py --since 2026-11-13
+```
+
+The script only reads `logs\skips.jsonl` and `config.toml`. It does not read `.env` and it does not send an order. With no date it uses today in the config timezone. `--day` is one calendar day. `--since` is that day and later. Counts are by reason, by day, and by window.
+
 ## Live PnL chart
 
-Run this in a third terminal while `bot.py` is running. It only reads `logs\trades.csv` and `logs\state.json` next to the script. It does not read `.env` and it does not send orders. Ctrl+C closes the chart and leaves the bot running. Times follow `timezone` in `config.toml` (currently America/Los_Angeles), not the Windows clock.
+Run this in a third terminal while `bot.py` is running. It only reads `logs\trades.csv` and `logs\state.json` next to the script. It does not read `.env` and it does not send orders. Ctrl+C closes the chart and leaves the bot running. Times follow `timezone` in `config.toml` (repository default America/Los_Angeles; set America/New_York for US Eastern), not the Windows clock.
 
 ```text
 .\.venv\Scripts\python.exe pnl_chart.py
@@ -217,9 +230,11 @@ Press Ctrl+C in the terminal that is running `bot.py`. Then:
 
 ```text
 git status
+git checkout main
 git pull
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe bot.py --check
+.\.venv\Scripts\python.exe skip_report.py --since 2026-11-13
 .\.venv\Scripts\python.exe -u bot.py
 ```
 
@@ -234,13 +249,14 @@ Leave the kill file in place if the next start must not enter. Remove it first w
 | `gates.py` | Edge, tick, depth, staleness, one-side, and geoblock decisions |
 | `live_exec.py` | Official SDK adapter, durable intents, reconcile, cancel |
 | `settlement.py` | Official outcome and restart restore |
-| `view.py` | Reads `logs/state.json` |
+| `view.py` | Reads `logs/state.json`, including open cost, reserved stake, and the cap |
 | `risk_report.py` | Official rows only. Green week does not enable live mode |
+| `skip_report.py` | Read-only counts of skip reasons by window and day |
 
-Logs in `logs/`: `signals.jsonl`, `trades.jsonl`, `trades.csv`, `ticks.jsonl`, `events.jsonl`, `state.json`, and `execution_state.json` (intents and open positions). Timestamps are America/Los_Angeles.
+Logs in `logs/`: `signals.jsonl`, `skips.jsonl`, `trades.jsonl`, `trades.csv`, `ticks.jsonl`, `events.jsonl`, `state.json`, and `execution_state.json` (intents and open positions). Timestamps use `timezone` in `config.toml`. The repository default is America/Los_Angeles. Set `America/New_York` for US Eastern. `state.json` includes `open_cost`, `reserved_cost`, and `max_open_cost_usd`. A start event in `events.jsonl` includes `max_open_cost_usd`, `order_type`, `submit_timeout_s`, `stake`, and `max_attempts_per_window`.
 
 ## Tests
 
-`python -m pytest -q` covers config and geoblock refusal, edge and price and stake, stale data, both-side blocking, partial and rejected and ambiguous submits, duplicate prevention across a restart, official settlement retry, and the Python-only command docs. The order API is mocked. GitHub Actions runs that suite on `windows-latest` and `ubuntu-latest` with Python 3.12.
+`python -m pytest -q` covers config and geoblock refusal, edge and price and stake, stale data, both-side blocking, partial and rejected and ambiguous submits, the `submit_timeout` versus `submit_error` distinction, a mocked reconcile that releases a miss and retries once, startup cleanup of stale intents, the balance skip, skip rows, duplicate prevention across a restart, official settlement retry, and the Python-only command docs. The order API is mocked. GitHub Actions runs that suite on `windows-latest` and `ubuntu-latest` with Python 3.12.
 
 Not tested, on purpose: no funded account, no real order, no cancel against the production CLOB, no live geoblock pass from an allowed country, and no claim that the model would have made money. A FAK partial caused by the book moving is implemented and mocked; the production matching engine was not exercised.

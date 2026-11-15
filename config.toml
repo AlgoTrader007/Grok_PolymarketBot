@@ -20,6 +20,10 @@ max_open_cost_usd = 75.0        # unsettled fill cost plus reserved stake
 max_attempts_per_window = 2     # a retry is allowed only after a confirmed zero-fill, same side only
 submit_timeout_s = 20
 geoblock_max_age_s = 30
+reconcile_delay_s = 3          # seconds before the read-only lookup after submit_unknown
+reconcile_attempts = 3         # bounded lookups; a confirmed miss can retry the same side
+unknown_expire_s = 3600        # drop an unresolved reservation this long after the window ends
+balance_max_age_s = 15         # cache the read-only pUSD balance and allowance check
 
 [scout]
 poll_interval_s  = 1.0    # RTDS snapshot re-request cadence (snapshot-only feed; see README)
@@ -35,4 +39,4 @@ prob_clip        = 0.002  # clamp fair probs to [clip, 1-clip]
 [app]
 log_dir          = "logs"
 tick_log_every_s = 5      # model/market snapshot cadence for calibration
-timezone         = "America/Los_Angeles"
+timezone         = "America/Los_Angeles"  # set America/New_York for US Eastern timestamps

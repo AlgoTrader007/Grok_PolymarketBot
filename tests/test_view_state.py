@@ -8,6 +8,13 @@ import persist
 import view
 
 
+def test_exposure_line_reads_open_reserved_and_cap():
+    assert view.exposure_text({"open_cost": 13.3, "reserved_cost": 30, "max_open_cost_usd": 75}) == (
+        "open $13.30  reserved $30.00  cap $75.00"
+    )
+    assert view.exposure_text({}) == "open -  reserved -  cap -"
+
+
 def test_clock_keeps_the_numeric_offset_and_does_not_say_pt():
     assert view.clock_text("2026-11-11T03:20:04.123-08:00") == "03:20:04-08:00"
     assert view.clock_text("2026-11-11T06:20:04.123456-05:00") == "06:20:04-05:00"
