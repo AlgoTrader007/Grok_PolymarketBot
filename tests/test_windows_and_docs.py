@@ -54,6 +54,11 @@ def test_python_commands_replace_shell_scripts():
     assert r"D:\python\Grok_Polymarket" in readme
     assert "POLYBTC_LIVE_CONFIRM" in readme
     assert "unreliable" in readme.lower()
+    assert "skip_report.py" in readme
+    assert "America/New_York" in readme
+    assert "unresolved_after_window" in readme
+    assert "submit_error" in readme
+    assert "insufficient_balance" in readme
 
 
 def test_check_and_kill_commands_do_not_trade(tmp_path):

@@ -8,6 +8,7 @@ check refuse new orders. This module does not read secrets from the repository.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from decimal import Decimal
@@ -30,16 +31,83 @@ LIVE_ENV_NAMES = (
     "POLYBTC_KILL",
 )
 _SCALE = Decimal("1000000")
+_HEX_KEY = re.compile(r"0x[a-fA-F0-9]{64}")
+# Stake still counts against the exposure cap while the exchange outcome is unknown.
+RESERVING_STATUSES = {"reserved", "submitting", "submit_unknown", "delayed", "accepted"}
 
 
 class AmbiguousSubmit(Exception):
     """The POST may have reached the exchange. Do not send another order yet."""
 
+    def __init__(self, error_class: str = "AmbiguousSubmit", message: str = ""):
+        self.error_class = str(error_class or "AmbiguousSubmit")
+        self.error_message = str(message or "")
+        text = self.error_class if not self.error_message else f"{self.error_class}: {self.error_message}"
+        super().__init__(text)
+
 
 class NotSent(Exception):
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, error_class: str | None = None, error_message: str = ""):
         super().__init__(reason)
         self.reason = reason
+        self.error_class = error_class
+        self.error_message = error_message
+
+
+def public_error(text: str, secrets=None, limit: int = 180) -> str:
+    """Short exception text safe to write into a log. Known secrets and private keys are removed."""
+    cleaned = persist.redact_text(str(text or ""), secrets or [])
+    cleaned = _HEX_KEY.sub("[redacted]", cleaned)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:limit]
+
+
+def reserving(intent: dict) -> bool:
+    return intent.get("status") in RESERVING_STATUSES and float(intent.get("shares") or 0) <= 0
+
+
+def spendable_usd(balance, allowance) -> Decimal | None:
+    """Lower of pUSD balance and allowance. None means the check has not run."""
+    if balance is None:
+        return None
+    amount = Decimal(str(balance))
+    if allowance is None:
+        return amount
+    return min(amount, Decimal(str(allowance)))
+
+
+def _units_to_usd(value) -> float | None:
+    """CLOB collateral integers are 6-decimal base units. Floats are already human pUSD."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    amount = Decimal(str(value))
+    if isinstance(value, float):
+        return float(amount)
+    return float(amount / _SCALE)
+
+
+def _allowance_usd(raw) -> float | None:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        if not raw:
+            return 0.0
+        amounts = [item for item in (_units_to_usd(value) for value in raw.values()) if item is not None]
+        return 0.0 if not amounts else float(min(amounts))
+    return _units_to_usd(raw)
+
+
+def collateral_snapshot(result) -> dict:
+    """Human pUSD from get_balance_allowance. Allowance is the smallest spender approval."""
+    if isinstance(result, dict):
+        balance_raw = result.get("balance")
+        allowances_raw = result.get("allowances", result.get("allowance"))
+    else:
+        balance_raw = getattr(result, "balance", None)
+        allowances_raw = getattr(result, "allowances", None)
+        if allowances_raw is None:
+            allowances_raw = getattr(result, "allowance", None)
+    return {"balance": _units_to_usd(balance_raw), "allowance": _allowance_usd(allowances_raw)}
 
 
 def live_config(cfg: dict, environ: dict) -> dict:
@@ -80,6 +148,10 @@ def live_config(cfg: dict, environ: dict) -> dict:
         "max_attempts": int(live.get("max_attempts_per_window", 2)),
         "submit_timeout_s": float(live.get("submit_timeout_s", 20)),
         "geoblock_max_age_s": float(live.get("geoblock_max_age_s", 30)),
+        "reconcile_delay_s": float(live.get("reconcile_delay_s", 3)),
+        "reconcile_attempts": int(live.get("reconcile_attempts", 3)),
+        "unknown_expire_s": float(live.get("unknown_expire_s", 3600)),
+        "balance_max_age_s": float(live.get("balance_max_age_s", 15)),
         "kill_env": str(environ.get("POLYBTC_KILL") or "") in {"1", "true", "TRUE", "yes", "YES"},
         "has_relayer": bool(environ.get("POLYMARKET_RELAYER_API_KEY") and environ.get("POLYMARKET_RELAYER_API_KEY_ADDRESS")),
         "has_builder": bool(
@@ -208,8 +280,7 @@ class ExecutionBook:
             return None
         if any(item.get("side") != side for item in intents):
             return "opposite_side"
-        inflight = {"reserved", "submitting", "submit_unknown", "delayed", "accepted"}
-        if any(item.get("status") in inflight or float(item.get("shares") or 0) > 0 for item in intents):
+        if any(item.get("status") in RESERVING_STATUSES or float(item.get("shares") or 0) > 0 for item in intents):
             return "already_entered"
         zeros = {"rejected", "unmatched", "absent"}
         if any(item.get("status") not in zeros for item in intents):
@@ -224,7 +295,7 @@ class ExecutionBook:
     def reserved_cost(self) -> float:
         total = 0.0
         for intent in self.intents:
-            if intent.get("status") in {"reserved", "submitting", "submit_unknown", "delayed", "accepted"} and float(intent.get("shares") or 0) <= 0:
+            if reserving(intent):
                 total += float(intent.get("stake_usd") or 0)
         return round(total, 6)
 
@@ -375,6 +446,9 @@ class Engine:
         self._geo_mono = 0.0
         self._geo_ok = None
         self._geo_reason = "not_checked"
+        self.balance_usd = None
+        self.allowance_usd = None
+        self._balance_mono = 0.0
 
     def adopt_logs(self, restored: dict) -> None:
         if self.book.positions or self.book.intents:
@@ -424,6 +498,47 @@ class Engine:
         self.block_reason = "ok"
         return True
 
+    def _secrets(self) -> list:
+        return list(getattr(self.broker, "secrets", None) or [])
+
+    def _error_text(self, text) -> str:
+        return public_error(text, self._secrets())
+
+    def _not_sent(self, intent_id: str, exc: NotSent) -> dict:
+        fields = {"status": "not_sent", "reason": exc.reason}
+        if exc.error_class:
+            fields["error_class"] = exc.error_class
+            fields["error_message"] = self._error_text(exc.error_message or exc.reason)
+        return self.book.mark(intent_id, **fields)
+
+    async def refresh_balance(self, force: bool = False) -> float | None:
+        """Read-only pUSD balance, cached for balance_max_age_s. Never submits."""
+        if not self.limits.get("requested"):
+            return None
+        max_age = float(self.limits.get("balance_max_age_s") or 15)
+        if not force and self.balance_usd is not None and (time.monotonic() - self._balance_mono) < max_age:
+            return self.balance_usd
+        broker = self.broker
+        if broker is None or getattr(broker, "client", None) is None:
+            return self.balance_usd
+        getter = getattr(broker, "balance_allowance", None)
+        if getter is None:
+            return self.balance_usd
+        try:
+            snapshot = await getter()
+        except Exception:
+            return self.balance_usd
+        if not isinstance(snapshot, dict):
+            snapshot = collateral_snapshot(snapshot)
+        balance = snapshot.get("balance")
+        if balance is None:
+            return self.balance_usd
+        self.balance_usd = float(balance)
+        allowance = snapshot.get("allowance")
+        self.allowance_usd = None if allowance is None else float(allowance)
+        self._balance_mono = time.monotonic()
+        return self.balance_usd
+
     async def submit(self, intent_id: str) -> dict:
         intent = self.book._intent(intent_id)
         if self.book.kill_latched(self.limits.get("kill_env", False)):
@@ -431,6 +546,18 @@ class Engine:
         allowed = await self.refresh_eligibility(force=False)
         if not allowed:
             return self.book.mark(intent_id, status="not_sent", reason=self.block_reason)
+        await self.refresh_balance()
+        spendable = spendable_usd(self.balance_usd, self.allowance_usd)
+        if spendable is not None:
+            fee = gates.entry_fee_estimate(
+                intent["stake_usd"], intent["limit_price"], intent["fee_rate"], intent["fee_exp"],
+            )
+            if spendable < Decimal(str(intent["stake_usd"])) + fee:
+                return self.book.mark(
+                    intent_id, status="not_sent", reason="insufficient_balance",
+                    error_class="insufficient_balance",
+                    error_message="pUSD balance or allowance is below stake plus fee",
+                )
         try:
             prepared = await self.broker.prepare_buy(
                 asset_id=intent["token_id"],
@@ -439,9 +566,12 @@ class Engine:
                 order_type=self.limits.get("order_type") or "FAK",
             )
         except NotSent as exc:
-            return self.book.mark(intent_id, status="not_sent", reason=exc.reason)
+            return self._not_sent(intent_id, exc)
         except Exception as exc:
-            return self.book.mark(intent_id, status="not_sent", reason=type(exc).__name__)
+            return self.book.mark(
+                intent_id, status="not_sent", reason=type(exc).__name__,
+                error_class=type(exc).__name__, error_message=self._error_text(exc),
+            )
         self.book.mark(
             intent_id,
             status="submitting",
@@ -450,31 +580,59 @@ class Engine:
             signed_taker=prepared.get("signed_taker"),
             submit_started=time.time(),
         )
+
+        async def _invoke_post():
+            try:
+                return await self.broker.post(prepared)
+            except (asyncio.CancelledError, NotSent, AmbiguousSubmit):
+                raise
+            except Exception as exc:
+                # An exception from post is not a wait_for timeout, even if its type is TimeoutError.
+                raise AmbiguousSubmit(type(exc).__name__, str(exc)) from exc
+
         try:
             result = await asyncio.wait_for(
-                self.broker.post(prepared),
+                _invoke_post(),
                 timeout=float(self.limits.get("submit_timeout_s") or 20),
             )
         except NotSent as exc:
-            return self.book.mark(intent_id, status="not_sent", reason=exc.reason)
-        except (asyncio.TimeoutError, AmbiguousSubmit, TimeoutError):
-            return self.book.mark(intent_id, status="submit_unknown", reason="submit_timeout")
-        except Exception:
-            return self.book.mark(intent_id, status="submit_unknown", reason="submit_error")
+            return self._not_sent(intent_id, exc)
+        except AmbiguousSubmit as exc:
+            return self.book.mark(
+                intent_id,
+                status="submit_unknown",
+                reason=f"submit_error:{exc.error_class}",
+                error_class=exc.error_class,
+                error_message=self._error_text(exc.error_message),
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            return self.book.mark(
+                intent_id,
+                status="submit_unknown",
+                reason="submit_timeout",
+                error_class="TimeoutError",
+                error_message="wait_for exceeded submit_timeout_s",
+            )
         return self._apply_result(intent_id, result)
 
     def _apply_result(self, intent_id: str, result: dict) -> dict:
         intent = self.book._intent(intent_id)
         disposition = result.get("disposition")
         if disposition == "rejected":
+            message = self._error_text(str(result.get("error") or "rejected")[:180])
             return self.book.mark(
                 intent_id,
                 status="rejected" if result.get("order_id") is None else "unmatched",
-                reason=str(result.get("error") or "rejected")[:180],
+                reason=message,
                 order_id=result.get("order_id"),
+                error_class="rejected",
+                error_message=message,
             )
         if disposition == "ambiguous":
-            return self.book.mark(intent_id, status="submit_unknown", order_id=result.get("order_id"), reason="ambiguous")
+            return self.book.mark(
+                intent_id, status="submit_unknown", order_id=result.get("order_id"), reason="ambiguous",
+                error_class="ambiguous", error_message="matched response had no fill amounts",
+            )
         status = str(result.get("status") or "").lower()
         order_id = result.get("order_id")
         if status in {"delayed", "live"}:
@@ -505,8 +663,29 @@ class Engine:
         self.book.record_position_from_intent(intent_id)
         return self.book._intent(intent_id)
 
-    async def reconcile_open(self) -> None:
-        """Resolve in-flight intents before any new submit. Unknown stays unknown."""
+    def _can_query(self) -> bool:
+        return self.broker is not None and getattr(self.broker, "client", None) is not None
+
+    def _reserving_ids(self) -> dict:
+        return {intent["id"]: True for intent in self.book.intents if reserving(intent)}
+
+    def _released_since(self, before: dict) -> list[dict]:
+        released = []
+        for intent_id in before:
+            try:
+                intent = self.book._intent(intent_id)
+            except KeyError:
+                continue
+            if not reserving(intent):
+                released.append(intent)
+        return released
+
+    async def reconcile_open(self, *, cancel_resting: bool = True) -> None:
+        """Resolve in-flight intents before any new submit. Unknown stays unknown.
+
+        This only reads orders and trades, plus the existing cancel of a resting
+        order when cancel_resting is true. It does not post a new order.
+        """
         for intent in list(self.book.intents):
             status = intent.get("status")
             if status == "reserved":
@@ -514,9 +693,95 @@ class Engine:
                 continue
             if status not in {"submitting", "submit_unknown", "delayed", "accepted"}:
                 continue
-            await self._reconcile_one(intent)
+            await self._reconcile_one(intent, cancel_resting=cancel_resting)
 
-    async def _reconcile_one(self, intent: dict) -> None:
+    async def reconcile_after_unknown(self, intent_id: str, *, delay_s: float | None = None, attempts: int | None = None, sleep=None, stopped=None) -> dict:
+        """Read-only lookup a few seconds after an ambiguous submit. Bounded retries.
+
+        A confirmed miss becomes absent, which drops the reservation and lets the
+        same side try again while the window and the other gates still allow it.
+        A fill is locked and is not retried. This does not post another order.
+        """
+        delay = float(self.limits.get("reconcile_delay_s") if delay_s is None else delay_s)
+        tries = int(self.limits.get("reconcile_attempts") if attempts is None else attempts)
+        pause = sleep or asyncio.sleep
+        halted = stopped or (lambda: False)
+        tries = max(1, tries)
+        for _attempt in range(tries):
+            if halted():
+                break
+            if delay > 0 and not await self._pause(delay, pause, halted):
+                break
+            intent = self.book._intent(intent_id)
+            if intent.get("status") != "submit_unknown":
+                return intent
+            await self._reconcile_one(intent, cancel_resting=False)
+            intent = self.book._intent(intent_id)
+            if intent.get("status") != "submit_unknown":
+                return intent
+        return self.book._intent(intent_id)
+
+    async def _pause(self, seconds: float, pause, halted) -> bool:
+        remaining = float(seconds)
+        while remaining > 0:
+            if halted():
+                return False
+            step = min(0.2, remaining)
+            await pause(step)
+            remaining -= step
+        return True
+
+    async def startup_cleanup(self, now: float, *, cancel_resting: bool = True) -> list[dict]:
+        """Release stuck reservations. Does not post an order.
+
+        With a client, open orders and trades are queried. A resting order is
+        cancelled only when cancel_resting is true. Without a client, an
+        unknown whose window ended more than unknown_expire_s ago is marked
+        expired and stops reserving.
+        """
+        before = self._reserving_ids()
+        if self._can_query():
+            await self.reconcile_open(cancel_resting=cancel_resting)
+        else:
+            for intent in list(self.book.intents):
+                if intent.get("status") == "reserved":
+                    self.book.mark(intent["id"], status="not_sent", reason="restart_before_submit")
+        self.expire_unresolved(now)
+        return self._released_since(before)
+
+    async def sweep_ended(self, now: float) -> list[dict]:
+        """After a window ends, look up unknowns and drop the ones with no fill."""
+        before = self._reserving_ids()
+        if self._can_query():
+            for intent in list(self.book.intents):
+                if not reserving(intent):
+                    continue
+                end = float(intent.get("end") or 0)
+                if end <= 0 or now < end:
+                    continue
+                if intent.get("status") == "reserved":
+                    self.book.mark(intent["id"], status="not_sent", reason="window_ended_before_submit")
+                    continue
+                await self._reconcile_one(intent, cancel_resting=True)
+        self.expire_unresolved(now)
+        return self._released_since(before)
+
+    def expire_unresolved(self, now: float) -> None:
+        """Stop reserving unknowns whose windows ended and stayed unresolved past the bound."""
+        expire_after = float(self.limits.get("unknown_expire_s") or 3600)
+        for intent in list(self.book.intents):
+            if not reserving(intent) or intent.get("status") == "reserved":
+                continue
+            end = float(intent.get("end") or 0)
+            if end <= 0 or now < end or (now - end) < expire_after:
+                continue
+            # A lookup that still sees the order is not "no fill". Leave it reserved
+            # until a later read shows it gone. Inconclusive lookups do expire.
+            if intent.get("reason") in {"resting_observed", "resting_cancel_requested"}:
+                continue
+            self.book.mark(intent["id"], status="expired", reason="unresolved_after_window")
+
+    async def _reconcile_one(self, intent: dict, *, cancel_resting: bool = True) -> None:
         intent_id = intent["id"]
         order_id = intent.get("order_id")
         try:
@@ -549,11 +814,15 @@ class Engine:
                 self.book.mark(intent_id, status="unmatched", order_id=order.get("id") or order_id, reason=order_status)
                 return
             if order_status in {"LIVE", "DELAYED", "OPEN"}:
-                try:
-                    await self.broker.cancel_all()
-                except Exception:
-                    pass
-                self.book.mark(intent_id, status="submit_unknown", order_id=order.get("id") or order_id, reason="resting_cancel_requested")
+                if cancel_resting:
+                    try:
+                        await self.broker.cancel_all()
+                    except Exception:
+                        pass
+                    self.book.mark(intent_id, status="submit_unknown", order_id=order.get("id") or order_id, reason="resting_cancel_requested")
+                else:
+                    resting = "delayed" if order_status == "DELAYED" else "accepted"
+                    self.book.mark(intent_id, status=resting, order_id=order.get("id") or order_id, reason="resting_observed")
                 return
         trades = await self._safe_trades(intent)
         if trades is None:
@@ -755,10 +1024,16 @@ class PolymarketBroker:
             response = await self.client.post_order(signed)
         except Exception as exc:
             name = type(exc).__name__
+            message = str(exc)
             if "UserInput" in name or "Validation" in name:
-                raise NotSent(name) from exc
-            raise AmbiguousSubmit(name) from exc
+                raise NotSent(f"validation:{name}", error_class=name, error_message=message) from exc
+            raise AmbiguousSubmit(name, message) from exc
         return normalize_sdk_response(response, prepared)
+
+    async def balance_allowance(self) -> dict:
+        """Read collateral pUSD. Does not submit and does not refresh approvals."""
+        result = await self.client.get_balance_allowance(asset_type="COLLATERAL")
+        return collateral_snapshot(result)
 
     async def get_order(self, order_id: str) -> dict | None:
         order = await self.client.get_order(order_id=order_id)

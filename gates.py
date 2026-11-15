@@ -49,6 +49,19 @@ def fee_usd(shares: Decimal, price: Decimal, rate: Decimal, exponent: Decimal) -
     return quantize_fee(shares * fee_per_share(price, rate, exponent))
 
 
+def entry_fee_estimate(stake, price, rate, exponent) -> Decimal:
+    """Taker fee for buying `stake` notional at `price`. Zero when the price cannot be a buy."""
+    stake_d = _d(stake)
+    price_d = _d(price)
+    rate_d = _d(rate)
+    exp_d = _d(exponent)
+    if None in (stake_d, price_d, rate_d, exp_d):
+        return Decimal(0)
+    if stake_d <= 0 or price_d <= 0 or price_d >= 1:
+        return Decimal(0)
+    return fee_usd(stake_d / price_d, price_d, rate_d, exp_d)
+
+
 def on_tick(price: Decimal, tick: Decimal) -> bool:
     if tick <= 0:
         return False
@@ -210,6 +223,8 @@ def evaluate_entry(
     open_cost_usd: float = 0.0,
     reserved_usd: float = 0.0,
     max_open_cost_usd: float = 0.0,
+    balance_usd: float | None = None,
+    allowance_usd: float | None = None,
 ) -> dict:
     """Decide whether one side may be entered. A skip never returns a reduced stake."""
     rate = Decimal(str(fee_rate))
@@ -249,6 +264,21 @@ def evaluate_entry(
         reasons.append("exposure_cap")
     if live and (tick_d is None or _d(min_order_size) is None):
         reasons.append("constraints_unknown")
+    if live and balance_usd is not None:
+        fee_price = cap
+        tradable = []
+        for raw_price, _raw_size in asks:
+            price = _d(raw_price)
+            if price is not None and Decimal(0) < price <= cap:
+                tradable.append(price)
+        if tradable:
+            fee_price = min(tradable)
+        fee_est = entry_fee_estimate(stake, fee_price, rate, exponent)
+        spendable = Decimal(str(balance_usd))
+        if allowance_usd is not None:
+            spendable = min(spendable, Decimal(str(allowance_usd)))
+        if spendable < stake + fee_est:
+            reasons.append("insufficient_balance")
 
     best = None
     best_edge = None

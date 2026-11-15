@@ -75,6 +75,23 @@ class State:
         self.shutdown = False
         self.pending_submits = []
         self.limits = {}
+        self.skip_keys = {}
+
+    def note_skip(self, start, side, reasons) -> bool:
+        """True when this window and side should append a skip row.
+
+        An empty reason list clears the memory and does not log. The same set
+        logs once; a different set logs again.
+        """
+        key = (int(start), str(side))
+        current = tuple(reasons or [])
+        if not current:
+            self.skip_keys.pop(key, None)
+            return False
+        if self.skip_keys.get(key) == current:
+            return False
+        self.skip_keys[key] = current
+        return True
 
 
 S = State()
@@ -273,7 +290,7 @@ async def discovery_loop(session):
         if S.book is not None:
             open_starts = {int(item["start"]) for item in S.book.positions if item.get("start") is not None}
             open_starts.update(int(item["start"]) for item in S.book.intents
-                               if item.get("start") is not None and item.get("status") not in {"not_sent", "rejected", "absent", "unmatched"})
+                               if item.get("start") is not None and item.get("status") not in {"not_sent", "rejected", "absent", "unmatched", "expired"})
         for st in [key for key in S.markets if key < cur - 3600 and key not in open_starts]:
             del S.markets[st]
         await asyncio.sleep(5)
@@ -454,6 +471,101 @@ def _venue_min(market, book):
     return gates.strictest_min_size((book or {}).get("min_order_size"), market.get("min_order_size"), market.get("clob_min_size"))
 
 
+def entry_ready(plan: dict, stake: float) -> bool:
+    """True only for a full configured stake. Paper never records a smaller one.
+
+    A live FAK can still fill less after this check. That partial is accounted
+    from the exchange response, not by shrinking the decision here.
+    """
+    if plan.get("action") != "enter":
+        return False
+    return float(plan.get("cost_usd") or 0) + 0.01 >= float(stake) and float(plan.get("shares") or 0) > 0
+
+
+def skip_record(*, slug, start, side, mode, reasons, fair, edge, ask, open_cost, reserved_cost, cap) -> dict:
+    """One skip row. ts_local is the config timezone (Eastern when that is America/New_York)."""
+    return {
+        "type": "skip",
+        "ts_local": la(),
+        "slug": slug,
+        "start": start,
+        "side": side,
+        "mode": mode,
+        "reasons": list(reasons),
+        "fair": fair,
+        "edge": edge,
+        "ask": ask,
+        "open_cost": open_cost,
+        "reserved_cost": reserved_cost,
+        "cap": cap,
+    }
+
+
+def live_submit_record(intent_id, result: dict) -> dict:
+    return {
+        "type": "live_submit",
+        "id": intent_id,
+        "status": result.get("status"),
+        "reason": result.get("reason"),
+        "order_id": result.get("order_id"),
+        "shares": result.get("shares"),
+        "cost_usd": result.get("cost_usd"),
+        "cost_basis": result.get("cost_basis"),
+        "error_class": result.get("error_class"),
+        "error_message": result.get("error_message"),
+    }
+
+
+def start_event() -> dict:
+    limits = S.limits or {}
+    return {
+        "type": "start",
+        "pid": os.getpid(),
+        "mode": S.mode,
+        "live_reason": S.live_reason,
+        "config_live_enabled": bool((CFG.get("live") or {}).get("enabled", False)),
+        "restored_open": len(S.positions),
+        "kill": bool(S.book and S.book.kill),
+        "max_open_cost_usd": limits.get("max_open_cost_usd"),
+        "order_type": limits.get("order_type"),
+        "submit_timeout_s": limits.get("submit_timeout_s"),
+        "stake": TC["size_usd"],
+        "max_attempts_per_window": limits.get("max_attempts"),
+        "open_cost": S.book.open_cost() if S.book else 0.0,
+        "reserved_cost": S.book.reserved_cost() if S.book else 0.0,
+    }
+
+
+def should_open_readonly_reconcile(limits: dict, environ: dict) -> bool:
+    """Paper may query the CLOB when a key and wallet exist and no proxy is set.
+
+    The lookup never posts. Missing credentials use the time-based expiry instead.
+    A ready live config connects on its own path, so this stays false there.
+    """
+    if limits.get("ready"):
+        return False
+    key = str(environ.get("POLYMARKET_PRIVATE_KEY") or "")
+    wallet = str(environ.get("POLYMARKET_WALLET_ADDRESS") or "")
+    if not key or not wallet:
+        return False
+    if gates.proxy_env_set(environ):
+        return False
+    return True
+
+
+def _log_released(items) -> None:
+    for item in items or []:
+        jlog("events.jsonl", {
+            "type": "reservation_released",
+            "id": item.get("id"),
+            "slug": item.get("slug"),
+            "side": item.get("side"),
+            "status": item.get("status"),
+            "reason": item.get("reason"),
+            "stake_usd": item.get("stake_usd"),
+        })
+
+
 _last_eval_t = 0.0
 def trader_eval(force=False):
     global _last_eval_t
@@ -490,6 +602,8 @@ def trader_eval(force=False):
         exch_age = (now - book["exch_ts"]) if book.get("exch_ts") else None
         block = S.book.entry_block(cur, side, 1 if not live_requested else attempts)
         occupied = side if block == "already_entered" else ("Down" if side == "Up" else "Up") if block == "opposite_side" else None
+        balance = S.engine.balance_usd if live_requested and S.engine is not None else None
+        allowance = S.engine.allowance_usd if live_requested and S.engine is not None else None
         plan = gates.evaluate_entry(
             fair=side_fair, asks=asks, fee_rate=mk["fee_rate"], fee_exp=mk["fee_exp"],
             max_price=TC["max_price"], edge_threshold=TC["edge_threshold"], size_usd=TC["size_usd"],
@@ -502,7 +616,10 @@ def trader_eval(force=False):
             live=live_requested, live_entry_allowed=bool(S.engine and S.engine.entry_allowed),
             open_cost_usd=S.book.open_cost(), reserved_usd=S.book.reserved_cost(),
             max_open_cost_usd=float(S.limits.get("max_open_cost_usd") or 0),
+            balance_usd=balance, allowance_usd=allowance,
         )
+        if plan["action"] == "enter" and not entry_ready(plan, TC["size_usd"]):
+            plan = {**plan, "action": "skip", "reasons": [*plan["reasons"], "insufficient_depth"]}
         ev["sides"][side] = {
             "fair": side_fair, "ask": plan["best_ask"], "ask_size": plan["best_ask_size"], "bid": max(book["bids"]) if book.get("bids") else None,
             "fee_ps": plan["fee_per_share"], "edge": plan["edge"], "book_age": round(now - book["t"], 1) if book.get("t") else None,
@@ -516,14 +633,20 @@ def trader_eval(force=False):
                "spot": fair["spot"], "twap": fair["twap"], "price_to_beat": fair["K"], "method": fair["method"],
                "sigma_ann": round(model.sec_to_ann(S.sigma), 3), "blocked": plan["reasons"], "rules": rules_reason}
         if plan["action"] != "enter":
-            key = (cur, side, tuple(plan["reasons"]))
-            if plan["reasons"] and S.last_eval.get("_sigkey") != key and any(
-                reason in plan["reasons"] for reason in ("insufficient_depth", "opposite_side", "edge", "price_cap", "feed_stale", "ptb_stale", "book_stale")
-            ):
+            if S.note_skip(cur, side, plan["reasons"]):
                 jlog("signals.jsonl", sig)
-                S.last_eval["_sigkey"] = key
+                jlog("skips.jsonl", skip_record(
+                    slug=mk["slug"], start=cur, side=side, mode=S.mode, reasons=plan["reasons"],
+                    fair=round(side_fair, 4),
+                    edge=None if plan["edge"] is None else round(plan["edge"], 4),
+                    ask=plan["best_ask"],
+                    open_cost=S.book.open_cost(),
+                    reserved_cost=S.book.reserved_cost(),
+                    cap=float(S.limits.get("max_open_cost_usd") or 0),
+                ))
             window_reasons.extend(plan["reasons"])
             continue
+        S.note_skip(cur, side, [])
         jlog("signals.jsonl", sig)
         if live_requested:
             intent = S.book.begin_intent({
@@ -558,7 +681,7 @@ def trader_eval(force=False):
                 book["asks"].pop(price, None)
         jlog("trades.jsonl", {"type": "paper_entry", **pos})
     ev["blocked"] = sorted(set(window_reasons))
-    S.last_eval = {**ev, "_sigkey": S.last_eval.get("_sigkey")}
+    S.last_eval = ev
 
 
 def _gamma_backoff(age_s: float) -> float:
@@ -658,13 +781,16 @@ async def housekeeping():
             if S.book is not None:
                 intents = [{"id": item.get("id"), "slug": item.get("slug"), "side": item.get("side"), "status": item.get("status"),
                             "shares": item.get("shares"), "cost_usd": item.get("cost_usd"), "order_id": item.get("order_id")}
-                           for item in S.book.intents if item.get("status") not in {"rejected", "absent", "unmatched", "not_sent"}]
+                           for item in S.book.intents if item.get("status") not in {"rejected", "absent", "unmatched", "not_sent", "expired"}]
             status = {"updated_la": la(), "updated_unix": round(now, 3), "uptime_s": int(now - S.started),
                       "eval": {k: v for k, v in snapshot.items() if k != "_sigkey"},
                       "sigma_src": S.sigma_src, "open_positions": S.positions, "realized_pnl": round(S.realized, 4),
                       "n_trades": S.n_trades, "n_wins": S.n_wins, "feed_age_s": round(now - S.last_feed_wall, 1) if S.last_feed_wall else None,
                       "markets": sorted(m["slug"] for m in S.markets.values()), "pid": os.getpid(), "mode": S.mode,
-                      "live_reason": S.live_reason, "kill": bool(S.book and S.book.kill), "open_intents": intents}
+                      "live_reason": S.live_reason, "kill": bool(S.book and S.book.kill), "open_intents": intents,
+                      "open_cost": round(S.book.open_cost(), 6) if S.book else 0.0,
+                      "reserved_cost": round(S.book.reserved_cost(), 6) if S.book else 0.0,
+                      "max_open_cost_usd": float((S.limits or {}).get("max_open_cost_usd") or 0)}
             persist.atomic_write(os.path.join(LOG, "state.json"), status)
         except Exception as exc:
             try:
@@ -675,20 +801,33 @@ async def housekeeping():
 
 
 async def execution_loop():
+    last_sweep = 0.0
     while not S.shutdown:
         if S.engine is not None and S.engine.broker is not None and S.limits.get("ready"):
             await S.engine.refresh_eligibility()
             S.live_reason = S.engine.block_reason
             S.mode = "live" if S.engine.entry_allowed else "live_blocked"
+            await S.engine.refresh_balance()
         if S.pending_submits and S.engine is not None:
             intent_id = S.pending_submits.pop(0)
             result = await S.engine.submit(intent_id)
             _sync()
-            jlog("trades.jsonl", {"type": "live_submit", "id": intent_id, "status": result.get("status"),
-                                  "reason": result.get("reason"), "order_id": result.get("order_id"),
-                                  "shares": result.get("shares"), "cost_usd": result.get("cost_usd"),
-                                  "cost_basis": result.get("cost_basis")})
+            jlog("trades.jsonl", live_submit_record(intent_id, result))
+            if result.get("status") == "submit_unknown":
+                result = await S.engine.reconcile_after_unknown(intent_id, stopped=lambda: S.shutdown)
+                _sync()
+                jlog("trades.jsonl", {
+                    "type": "live_reconcile", "id": intent_id, "status": result.get("status"),
+                    "reason": result.get("reason"), "order_id": result.get("order_id"),
+                    "shares": result.get("shares"), "cost_usd": result.get("cost_usd"),
+                })
         else:
+            now = time.time()
+            if S.engine is not None and now - last_sweep >= 15:
+                last_sweep = now
+                released = await S.engine.sweep_ended(now)
+                _log_released(released)
+                _sync()
             await asyncio.sleep(0.2)
 
 
@@ -710,11 +849,38 @@ def configure_runtime():
     _sync()
 
 
+async def _readonly_startup_reconcile() -> None:
+    """Clean stuck intents without posting. Paper closes the client before trading starts."""
+    if S.engine is None:
+        return
+    if not should_open_readonly_reconcile(S.limits, os.environ):
+        _log_released(await S.engine.startup_cleanup(time.time(), cancel_resting=False))
+        return
+    broker = live_exec.PolymarketBroker(os.environ)
+    try:
+        await broker.connect()
+    except Exception as exc:
+        jlog("events.jsonl", {"type": "reconcile_connect_failed", "err": type(exc).__name__})
+        await broker.close()
+        _log_released(await S.engine.startup_cleanup(time.time(), cancel_resting=False))
+        return
+    S.engine.broker = broker
+    try:
+        released = await S.engine.startup_cleanup(time.time(), cancel_resting=False)
+    finally:
+        await broker.close()
+        S.engine.broker = None
+        S.engine.entry_allowed = False
+    _log_released(released)
+
+
 async def _arm_live():
     if not S.limits.get("requested"):
         S.mode = "paper"
         S.live_reason = "live_disabled"
         S.engine = live_exec.Engine(S.book, None, S.limits)
+        await _readonly_startup_reconcile()
+        _sync()
         return None
     if not S.limits.get("ready"):
         S.mode = "live_blocked"
@@ -722,6 +888,8 @@ async def _arm_live():
         S.engine = live_exec.Engine(S.book, None, S.limits)
         S.engine.entry_allowed = False
         S.engine.block_reason = S.live_reason
+        await _readonly_startup_reconcile()
+        _sync()
         return None
     broker = live_exec.PolymarketBroker(os.environ)
     S.engine = live_exec.Engine(S.book, broker, S.limits)
@@ -738,7 +906,10 @@ async def _arm_live():
         await S.engine.refresh_eligibility(force=True)
     S.mode = "live" if S.engine.entry_allowed else "live_blocked"
     S.live_reason = S.engine.block_reason
-    await S.engine.reconcile_open()
+    released = await S.engine.startup_cleanup(time.time(), cancel_resting=True)
+    _log_released(released)
+    if getattr(broker, "client", None) is not None:
+        await S.engine.refresh_balance(force=True)
     _sync()
     return broker
 
@@ -758,9 +929,7 @@ async def _shutdown(broker):
 async def main():
     configure_runtime()
     broker = await _arm_live()
-    jlog("events.jsonl", {"type": "start", "pid": os.getpid(), "mode": S.mode, "live_reason": S.live_reason,
-                          "config_live_enabled": bool((CFG.get("live") or {}).get("enabled", False)),
-                          "restored_open": len(S.positions), "kill": bool(S.book.kill)})
+    jlog("events.jsonl", start_event())
     async with aiohttp.ClientSession(trust_env=False, headers={"User-Agent": "polybtc/1.0"}) as session:
         await bootstrap_sigma(session)
         for pos in list(S.positions):

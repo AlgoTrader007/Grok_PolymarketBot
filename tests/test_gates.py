@@ -91,6 +91,34 @@ def test_one_direction_blocks_the_other_side_and_a_second_entry():
     assert "already_entered" in same["reasons"]
 
 
+def test_balance_below_stake_plus_fee_is_insufficient_balance():
+    short = gates.evaluate_entry(**_kw(live=True, live_entry_allowed=True, balance_usd=15.50, allowance_usd=100))
+    assert "insufficient_balance" in short["reasons"]
+    assert short["action"] == "skip"
+    allowed = gates.evaluate_entry(**_kw(live=True, live_entry_allowed=True, balance_usd=16, allowance_usd=100))
+    assert allowed["action"] == "enter"
+    thin_allowance = gates.evaluate_entry(**_kw(
+        live=True, live_entry_allowed=True, balance_usd=100, allowance_usd=1,
+    ))
+    assert "insufficient_balance" in thin_allowance["reasons"]
+    paper = gates.evaluate_entry(**_kw(live=False, balance_usd=0, allowance_usd=0))
+    assert paper["action"] == "enter"
+    assert gates.entry_fee_estimate(15, "0.50", "0.07", 1) == Decimal("0.52500")
+
+
+def test_omitted_skip_codes_are_all_returned_together():
+    plan = gates.evaluate_entry(**_kw(
+        live=True, live_entry_allowed=False, elapsed=1, secs_left=5, occupied_side="Up",
+        open_cost_usd=70, tick=None, balance_usd=1, allowance_usd=1,
+    ))
+    for code in (
+        "too_early", "too_late", "already_entered", "live_not_allowed", "exposure_cap",
+        "constraints_unknown", "insufficient_balance",
+    ):
+        assert code in plan["reasons"]
+    assert plan["action"] == "skip"
+
+
 def test_live_constraints_and_exposure_cap():
     missing = gates.evaluate_entry(**_kw(live=True, live_entry_allowed=True, tick=None))
     assert "constraints_unknown" in missing["reasons"]
